@@ -880,13 +880,6 @@
       'input[name="chapter_name_extend"]',
       '#chapter_name_extend'
     ];
-    const indexSelectors = [
-      'input[name="chapter_index"]',
-      '#chapter_index',
-      'input[name="wp-manga-chapter-index"]',
-      '#wp-manga-chapter-index',
-      'input[name="menu_order"]'
-    ];
     const contentSelectors = [
       'textarea[name="chapter_content"]',
       'textarea[name="wp-manga-chapter-content"]',
@@ -986,7 +979,6 @@
     };
 
     const filledTitle = fillChapterTitleFields();
-    tryFill(indexSelectors, chapter.index || '');
     const filledEditorContent = fillEditorContent(chapter.content);
     const filledTextareaContent = tryFill(contentSelectors, chapter.content);
     const filledContent = filledEditorContent || filledTextareaContent;
