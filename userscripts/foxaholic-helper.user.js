@@ -867,14 +867,18 @@
       chapterTab.click();
     }
 
-    const nameSelectors = [
+    const chapterNameSelectors = [
       'input[name="chapter_name"]',
       '#chapter_name',
       'input[name="wp-manga-chapter-name"]',
       '#wp-manga-chapter-name',
+      'input[name="post_title"]'
+    ];
+    const nameExtendSelectors = [
       'input[name="wp-manga-chapter-name-extend"]',
       '#wp-manga-chapter-name-extend',
-      'input[name="post_title"]'
+      'input[name="chapter_name_extend"]',
+      '#chapter_name_extend'
     ];
     const indexSelectors = [
       'input[name="chapter_index"]',
@@ -899,6 +903,54 @@
         }
       }
       return false;
+    };
+
+    const splitChapterTitle = (rawTitle) => {
+      const normalized = String(rawTitle || '').trim();
+      if (!normalized) {
+        return { chapterName: '', chapterNameExtend: '' };
+      }
+
+      const matched = normalized.match(/^((?:chapter|ch|c)\s*\d+(?:\.\d+)?|第\s*\d+\s*[章节回]?)(?:\s*[:：\-–—]\s*)(.+)$/i);
+      if (matched) {
+        return {
+          chapterName: matched[1].trim(),
+          chapterNameExtend: matched[2].trim()
+        };
+      }
+
+      return { chapterName: normalized, chapterNameExtend: '' };
+    };
+
+    const fillChapterTitleFields = () => {
+      const rawTitle = String(chapter.title || '').trim();
+      if (!rawTitle) {
+        return false;
+      }
+
+      const { chapterName, chapterNameExtend } = splitChapterTitle(rawTitle);
+      const hasExtendField = Boolean(document.querySelector(nameExtendSelectors.join(', ')));
+
+      if (!chapterNameExtend) {
+        return tryFill(chapterNameSelectors, rawTitle);
+      }
+
+      const filledMain = tryFill(chapterNameSelectors, chapterName);
+      if (!filledMain) {
+        return false;
+      }
+
+      if (!hasExtendField) {
+        tryFill(chapterNameSelectors, rawTitle);
+        return true;
+      }
+
+      const filledExtend = tryFill(nameExtendSelectors, chapterNameExtend);
+      if (!filledExtend) {
+        tryFill(chapterNameSelectors, rawTitle);
+      }
+
+      return true;
     };
 
     const fillEditorContent = (value) => {
@@ -933,7 +985,7 @@
       return false;
     };
 
-    const filledTitle = tryFill(nameSelectors, chapter.title);
+    const filledTitle = fillChapterTitleFields();
     tryFill(indexSelectors, chapter.index || '');
     const filledEditorContent = fillEditorContent(chapter.content);
     const filledTextareaContent = tryFill(contentSelectors, chapter.content);
