@@ -95,7 +95,9 @@ uv add --dev pytest
 
 ### 5.2 油猴面板没出现
 - 检查 URL 是否匹配脚本 `@match`
-- 确认 shared 脚本已先加载
+- 确认主脚本已启用：`userscripts/foxaholic-helper.user.js` / `userscripts/novelupdates-helper.user.js`
+- 当前版本支持单文件模式：未安装 `userscripts/shared/*.js` 也可运行
+- 控制台可执行 `window.SynNovelShared` 自检模块加载情况
 
 ### 5.3 NU 自动填表失败
 - 目标页面 DOM 可能变更，优先检查下拉框选择器
