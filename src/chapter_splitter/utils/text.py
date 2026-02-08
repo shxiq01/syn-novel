@@ -4,6 +4,9 @@ from collections.abc import Iterable
 import re
 
 
+CLOSING_MARKS = set('”」』》】〕）)]}\"')
+
+
 def normalize_newlines(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
@@ -42,8 +45,28 @@ def split_by_sentence(text: str, target_chars: int = 1000) -> list[str]:
     if not normalized:
         return []
 
-    sentence_tokens = re.split(r"(?<=[。.!?！？])", normalized)
-    sentence_tokens = [token.strip() for token in sentence_tokens if token.strip()]
+    sentence_tokens: list[str] = []
+    cursor = 0
+    token: list[str] = []
+
+    while cursor < len(normalized):
+        char = normalized[cursor]
+        token.append(char)
+        cursor += 1
+
+        if char in "。.!?！？":
+            while cursor < len(normalized) and normalized[cursor] in CLOSING_MARKS:
+                token.append(normalized[cursor])
+                cursor += 1
+            sentence = "".join(token).strip()
+            if sentence:
+                sentence_tokens.append(sentence)
+            token = []
+
+    if token:
+        tail = "".join(token).strip()
+        if tail:
+            sentence_tokens.append(tail)
 
     if not sentence_tokens:
         return [normalized]

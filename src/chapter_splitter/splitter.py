@@ -18,6 +18,9 @@ class SplitPiece:
         return len(self.content)
 
 
+CLOSING_MARKS = set('”」』》】〕）)]}\"')
+
+
 def calculate_split_count(char_count: int, target: int, min_ratio: float, max_ratio: float) -> int:
     if char_count <= 0:
         return 1
@@ -43,6 +46,27 @@ def _closest(candidates: list[int], target: int) -> int | None:
     return min(candidates, key=lambda value: abs(value - target))
 
 
+def _extend_right_closing_marks(text: str, point: int) -> int:
+    cursor = max(0, min(len(text), point))
+    while cursor < len(text) and text[cursor] in CLOSING_MARKS:
+        cursor += 1
+    return cursor
+
+
+def _rebalance_piece_edges(left: str, right: str) -> tuple[str, str]:
+    if not right:
+        return left, right
+
+    cursor = 0
+    while cursor < len(right) and right[cursor] in CLOSING_MARKS:
+        cursor += 1
+
+    if cursor == 0:
+        return left, right
+
+    return left + right[:cursor], right[cursor:].lstrip()
+
+
 def find_split_point(text: str, target_pos: int, search_range: int = 200) -> int:
     if not text:
         return 0
@@ -59,12 +83,12 @@ def find_split_point(text: str, target_pos: int, search_range: int = 200) -> int
     sentence_breaks = [start + match.end() for match in re.finditer(r"[。.!?！？]", window)]
     best_sentence = _closest(sentence_breaks, target_pos)
     if best_sentence is not None:
-        return best_sentence
+        return _extend_right_closing_marks(text, best_sentence)
 
     comma_breaks = [start + match.end() for match in re.finditer(r"[,，]", window)]
     best_comma = _closest(comma_breaks, target_pos)
     if best_comma is not None:
-        return best_comma
+        return _extend_right_closing_marks(text, best_comma)
 
     return max(1, min(len(text) - 1, target_pos))
 
@@ -95,6 +119,13 @@ def split_content(
 
         left = remaining[:split_point].strip()
         right = remaining[split_point:].strip()
+
+        if not left or not right:
+            hard_point = max(1, len(remaining) // remaining_count)
+            left = remaining[:hard_point].strip()
+            right = remaining[hard_point:].strip()
+
+        left, right = _rebalance_piece_edges(left, right)
 
         if not left or not right:
             hard_point = max(1, len(remaining) // remaining_count)
