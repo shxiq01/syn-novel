@@ -527,7 +527,7 @@
     if (location.search.includes('page=wp-manga-chapter') || location.search.includes('text-chapter')) {
       return true;
     }
-    return Boolean(document.querySelector('input[name="chapter_name"], input#chapter_name, textarea[name="chapter_content"], textarea#content'));
+    return Boolean(document.querySelector('input[name="chapter_name"], input#chapter_name, input[name="wp-manga-chapter-name"], #wp-manga-chapter-name, #wp-manga-content-chapter-create, textarea[name="chapter_content"], textarea#content'));
   };
 
   const slugify = (text) =>
@@ -543,7 +543,7 @@
     const id = idMatch ? Number.parseInt(idMatch[1], 10) : null;
     const titleEl = row.querySelector('.row-title');
     const title = titleEl ? titleEl.textContent.trim() : `novel-${id || Date.now()}`;
-    const statusText = (row.querySelector('.column-status, .status')?.textContent || '').trim();
+    const statusText = (row.querySelector('.column-status, .status, .comment_status, [data-colname="Project Status"], td[class*="status"]')?.textContent || '').trim();
     return {
       id,
       title,
@@ -580,25 +580,27 @@
   };
 
   const parseChapterNodes = (doc, baseUrl) => {
-    const chapterNodes = doc.querySelectorAll('.chapter-item, .manga-chapter-item, .wp-manga-chapter, li.chapter-item, tr.chapter-item');
+    const chapterNodes = doc.querySelectorAll('.chapter-item, .manga-chapter-item, .wp-manga-chapter, li.chapter-item, tr.chapter-item, a.wp-manga-edit-chapter, .wp-manga-chapter-item a');
     const chapters = [];
 
     chapterNodes.forEach((node) => {
-      const text = (node.textContent || '').replace(/\s+/g, ' ').trim();
+      const container = node.closest('li, tr, .wp-manga-chapter-item, .wp-manga-chapter') || node;
+      const text = (container.textContent || node.textContent || '').replace(/\s+/g, ' ').trim();
       if (!text) {
         return;
       }
 
       const chapterId = text.match(/\[(\d+)\]/)?.[1] || node.getAttribute('data-id') || '';
-      const chapterIndex = Parser.extractChapterNum(text) || Number.parseInt(node.getAttribute('data-index') || '', 10) || null;
+      const chapterIndex = Parser.extractChapterNum(text) || Number.parseInt(node.getAttribute('data-index') || container.getAttribute?.('data-index') || '', 10) || null;
       if (!chapterIndex) {
         return;
       }
 
       const unlockTime = parseUnlockTime(text);
       const unlocked = !text.includes('🔒') && !/Unlock on/i.test(text);
-      const link = node.querySelector('a[href*="chapter-"]');
-      const chapterUrl = link?.href || Parser.buildChapterUrl(baseUrl, chapterIndex);
+      const link = node.matches('a') ? node : node.querySelector('a[href]');
+      const rawUrl = link?.href || '';
+      const chapterUrl = /\/novel\/.+\/chapter-\d+/i.test(rawUrl) ? rawUrl : Parser.buildChapterUrl(baseUrl, chapterIndex);
 
       chapters.push({
         id: chapterId ? Number.parseInt(chapterId, 10) : chapterIndex,
@@ -610,7 +612,14 @@
       });
     });
 
-    return chapters.sort((a, b) => a.index - b.index);
+    const deduped = new Map();
+    chapters.forEach((chapter) => {
+      if (!deduped.has(chapter.index)) {
+        deduped.set(chapter.index, chapter);
+      }
+    });
+
+    return [...deduped.values()].sort((a, b) => a.index - b.index);
   };
 
   const scanNovelById = async (novelMeta) => {
@@ -654,15 +663,25 @@
     await Storage.update('meta.selectedNovelIds', ids);
   };
 
+  const collectSelectedNovelIdsFromTable = () => {
+    const rows = [...document.querySelectorAll('#the-list tr[id^="post-"]')];
+    return rows
+      .map((row) => {
+        const meta = getRowNovelMeta(row);
+        const box = row.querySelector('.synnovel-checkbox, .check-column input[type="checkbox"][name="post[]"]');
+        if (!meta.id || !box?.checked) {
+          return null;
+        }
+        return meta.id;
+      })
+      .filter(Boolean);
+  };
+
   const injectRowCheckboxes = async () => {
     const selectedIds = await ensureSelection();
     const rows = [...document.querySelectorAll('#the-list tr[id^="post-"]')];
 
     rows.forEach((row) => {
-      if (row.querySelector('.synnovel-checkbox')) {
-        return;
-      }
-
       const meta = getRowNovelMeta(row);
       if (!meta.id) {
         return;
@@ -673,24 +692,44 @@
         return;
       }
 
-      const checkbox = document.createElement('input');
-      checkbox.type = 'checkbox';
-      checkbox.className = 'synnovel-checkbox';
-      checkbox.dataset.novelId = String(meta.id);
-      checkbox.style.marginLeft = '6px';
-      checkbox.checked = selectedIds.includes(meta.id);
-      checkbox.addEventListener('change', async () => {
-        const allBoxes = [...document.querySelectorAll('.synnovel-checkbox')];
-        const ids = allBoxes.filter((box) => box.checked).map((box) => Number.parseInt(box.dataset.novelId, 10));
-        await persistSelection(ids);
-      });
+      let checkbox = row.querySelector('.check-column input[type="checkbox"][name="post[]"]');
+      if (!checkbox) {
+        checkbox = row.querySelector('.synnovel-checkbox');
+      }
 
-      cell.appendChild(checkbox);
+      if (!checkbox) {
+        checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.style.marginLeft = '6px';
+        cell.appendChild(checkbox);
+      }
+
+      checkbox.classList.add('synnovel-checkbox');
+      checkbox.dataset.novelId = String(meta.id);
+
+      if (selectedIds.includes(meta.id)) {
+        checkbox.checked = true;
+      }
+
+      if (!checkbox.dataset.synnovelBound) {
+        checkbox.addEventListener('change', async () => {
+          const ids = collectSelectedNovelIdsFromTable();
+          await persistSelection(ids);
+        });
+        checkbox.dataset.synnovelBound = '1';
+      }
     });
   };
 
   const scanSelectedNovels = async () => {
-    const selectedIds = await ensureSelection();
+    let selectedIds = await ensureSelection();
+    if (!selectedIds.length) {
+      selectedIds = collectSelectedNovelIdsFromTable();
+      if (selectedIds.length) {
+        await persistSelection(selectedIds);
+      }
+    }
+
     if (!selectedIds.length) {
       UI.toast('请先勾选要扫描的小说', 'warn');
       return;
@@ -731,7 +770,7 @@
     rows.forEach((row) => {
       const meta = getRowNovelMeta(row);
       const isActive = /active/i.test(meta.statusText);
-      const box = row.querySelector('.synnovel-checkbox');
+      const box = row.querySelector('.synnovel-checkbox, .check-column input[type="checkbox"][name="post[]"]');
       if (box) {
         box.checked = isActive;
       }
@@ -745,7 +784,7 @@
   };
 
   const clearSelection = async () => {
-    const boxes = [...document.querySelectorAll('.synnovel-checkbox')];
+    const boxes = [...document.querySelectorAll('.synnovel-checkbox, .check-column input[type="checkbox"][name="post[]"]')];
     boxes.forEach((box) => {
       box.checked = false;
     });
@@ -823,9 +862,35 @@
   };
 
   const fillChapterForm = async (chapter) => {
-    const nameSelectors = ['input[name="chapter_name"]', '#chapter_name', 'input[name="post_title"]'];
-    const indexSelectors = ['input[name="chapter_index"]', '#chapter_index', 'input[name="menu_order"]'];
-    const contentSelectors = ['textarea[name="chapter_content"]', '#content', 'textarea[name="post_content"]'];
+    const chapterTab = document.querySelector('a[href="#chapter-content"], a[href*="chapter-content"]');
+    if (chapterTab) {
+      chapterTab.click();
+    }
+
+    const nameSelectors = [
+      'input[name="chapter_name"]',
+      '#chapter_name',
+      'input[name="wp-manga-chapter-name"]',
+      '#wp-manga-chapter-name',
+      'input[name="wp-manga-chapter-name-extend"]',
+      '#wp-manga-chapter-name-extend',
+      'input[name="post_title"]'
+    ];
+    const indexSelectors = [
+      'input[name="chapter_index"]',
+      '#chapter_index',
+      'input[name="wp-manga-chapter-index"]',
+      '#wp-manga-chapter-index',
+      'input[name="menu_order"]'
+    ];
+    const contentSelectors = [
+      'textarea[name="chapter_content"]',
+      'textarea[name="wp-manga-chapter-content"]',
+      '#wp-manga-chapter-content',
+      'textarea[name="wp-manga-chapter-content-wp-editor"]',
+      '#wp-manga-chapter-content-wp-editor',
+      'textarea[name="post_content"]'
+    ];
 
     const tryFill = (selectors, value) => {
       for (const selector of selectors) {
@@ -836,9 +901,30 @@
       return false;
     };
 
+    const fillEditorContent = (value) => {
+      const content = String(value || '');
+      const editorA = window.tinymce?.get?.('wp-manga-chapter-content');
+      const editorB = window.tinymce?.get?.('wp-manga-chapter-content-wp-editor');
+      if (editorA || editorB) {
+        editorA?.setContent(content.replace(/\n/g, '<br />'));
+        editorB?.setContent(content.replace(/\n/g, '<br />'));
+        return true;
+      }
+
+      const iframe = document.querySelector('#wp-manga-chapter-content_ifr');
+      const body = iframe?.contentDocument?.body;
+      if (body) {
+        body.innerHTML = content.replace(/\n/g, '<br />');
+        body.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+      }
+
+      return false;
+    };
+
     const filledTitle = tryFill(nameSelectors, chapter.title);
     tryFill(indexSelectors, chapter.index || '');
-    const filledContent = tryFill(contentSelectors, chapter.content);
+    const filledContent = tryFill(contentSelectors, chapter.content) || fillEditorContent(chapter.content);
 
     if (!filledTitle || !filledContent) {
       throw new Error('chapter form selector mismatch');
