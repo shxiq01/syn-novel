@@ -1,0 +1,12 @@
+llm:
+  provider: deepseek
+  model: deepseek-chat
+splitter:
+  target_chars: 900
+  min_ratio: 0.7
+  max_ratio: 1.3
+formats:
+  zh: "第{num}章：{title} ({part}/{total})"
+  zh_no_split: "第{num}章：{title}"
+fallback:
+  no_chapter_detected: paragraph

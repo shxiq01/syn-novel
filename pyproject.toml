@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "syn-novel"
+version = "0.1.0"
+description = "Novel chapter splitting and publishing helpers"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "click>=8.1.7",
+  "openai>=1.50.0",
+  "PyYAML>=6.0.1",
+  "python-dotenv>=1.0.1",
+  "regex>=2024.5.15",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-q"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]

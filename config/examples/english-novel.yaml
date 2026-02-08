@@ -1,0 +1,12 @@
+llm:
+  provider: grok
+  model: grok-2-latest
+splitter:
+  target_chars: 1100
+  min_ratio: 0.7
+  max_ratio: 1.3
+formats:
+  en: "Chapter {num}: {title} (part {part})"
+  en_no_split: "Chapter {num}: {title}"
+fallback:
+  no_chapter_detected: sentence
