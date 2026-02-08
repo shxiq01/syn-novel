@@ -33,13 +33,17 @@ class ParsedChapter:
 class ParseResult:
     chapters: list[ParsedChapter]
     strategy: str
+    leading_text: str = ""
 
 
-def _parse_with_patterns(text: str, patterns: tuple[Pattern[str], ...]) -> list[ParsedChapter]:
-    lines = text.splitlines()
+def _extract_chapters_and_leading_text(
+    text: str,
+    patterns: tuple[Pattern[str], ...],
+) -> tuple[list[ParsedChapter], str]:
+    raw_lines = text.splitlines(keepends=True)
     heading_indices: list[int] = []
 
-    for idx, raw_line in enumerate(lines):
+    for idx, raw_line in enumerate(raw_lines):
         line = raw_line.strip()
         if not line:
             continue
@@ -47,31 +51,37 @@ def _parse_with_patterns(text: str, patterns: tuple[Pattern[str], ...]) -> list[
             heading_indices.append(idx)
 
     if not heading_indices:
-        return []
+        return [], ""
+
+    leading_text = "".join(raw_lines[: heading_indices[0]])
 
     chapters: list[ParsedChapter] = []
     for i, start_idx in enumerate(heading_indices):
-        end_idx = heading_indices[i + 1] if i + 1 < len(heading_indices) else len(lines)
-        heading = lines[start_idx].strip()
-        content_lines = lines[start_idx + 1 : end_idx]
-        content = "\n".join(content_lines).strip()
+        end_idx = heading_indices[i + 1] if i + 1 < len(heading_indices) else len(raw_lines)
+        heading = raw_lines[start_idx].strip()
+        content_lines = raw_lines[start_idx + 1 : end_idx]
+        content = "".join(content_lines).strip()
         chapters.append(ParsedChapter(original_title=heading, content=content))
 
-    return chapters
+    return chapters, leading_text
 
 
-def _parse_with_llm_pattern(text: str, llm_client: object | None, sample_text: str) -> list[ParsedChapter]:
+def _parse_with_llm_pattern(
+    text: str,
+    llm_client: object | None,
+    sample_text: str,
+) -> tuple[list[ParsedChapter], str]:
     if llm_client is None:
-        return []
+        return [], ""
 
     detector = getattr(llm_client, "detect_chapter_pattern", None)
     if detector is None:
-        return []
+        return [], ""
 
     try:
         result = detector(sample_text)
     except Exception:
-        return []
+        return [], ""
 
     pattern_text = ""
     if isinstance(result, str):
@@ -80,14 +90,14 @@ def _parse_with_llm_pattern(text: str, llm_client: object | None, sample_text: s
         pattern_text = str(result.get("pattern", "")).strip()
 
     if not pattern_text:
-        return []
+        return [], ""
 
     try:
         pattern = re.compile(pattern_text, re.IGNORECASE)
     except re.error:
-        return []
+        return [], ""
 
-    return _parse_with_patterns(text, (pattern,))
+    return _extract_chapters_and_leading_text(text, (pattern,))
 
 
 def _fallback_parse(text: str, mode: str = "paragraph", target_chars: int = 1000) -> list[ParsedChapter]:
@@ -114,17 +124,17 @@ def parse_chapters(
     fallback_mode: str = "paragraph",
     target_chars: int = 1000,
 ) -> ParseResult:
-    chapters = _parse_with_patterns(text, DEFAULT_CHAPTER_PATTERNS)
+    chapters, leading_text = _extract_chapters_and_leading_text(text, DEFAULT_CHAPTER_PATTERNS)
     if chapters:
-        return ParseResult(chapters=chapters, strategy="regex")
+        return ParseResult(chapters=chapters, strategy="regex", leading_text=leading_text)
 
-    llm_chapters = _parse_with_llm_pattern(
+    llm_chapters, llm_leading_text = _parse_with_llm_pattern(
         text=text,
         llm_client=llm_client,
         sample_text=llm_sample_text or text[:6000],
     )
     if llm_chapters:
-        return ParseResult(chapters=llm_chapters, strategy="llm_pattern")
+        return ParseResult(chapters=llm_chapters, strategy="llm_pattern", leading_text=llm_leading_text)
 
     fallback_chapters = _fallback_parse(text, mode=fallback_mode, target_chars=target_chars)
-    return ParseResult(chapters=fallback_chapters, strategy=f"fallback_{fallback_mode}")
+    return ParseResult(chapters=fallback_chapters, strategy=f"fallback_{fallback_mode}", leading_text="")

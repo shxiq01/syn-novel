@@ -118,6 +118,7 @@ class ChapterSplitterPipeline:
             separator=self.config.splitter.separator,
             blank_lines=self.config.output.blank_lines_between_chapters,
             encoding=self.config.output.encoding,
+            leading_text=parse_result.leading_text,
         )
 
         return ProcessResult(
