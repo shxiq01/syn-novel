@@ -8,15 +8,15 @@ __pycache__/
 *.pyd
 .pytest_cache/
 *.egg-info/
-
 # Virtual env
 .venv/
-
 # Agent / planning artifacts
 .codex/
-
 # Local env
 .env
-
 # Generated outputs
 *_split.txt
+# Local agent/editor workspaces
+.claude/
+.cursor/
+.trellis/
