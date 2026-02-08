@@ -903,19 +903,30 @@
 
     const fillEditorContent = (value) => {
       const content = String(value || '');
+      const html = content.replace(/\n/g, '<br />');
       const editorA = window.tinymce?.get?.('wp-manga-chapter-content');
       const editorB = window.tinymce?.get?.('wp-manga-chapter-content-wp-editor');
       if (editorA || editorB) {
-        editorA?.setContent(content.replace(/\n/g, '<br />'));
-        editorB?.setContent(content.replace(/\n/g, '<br />'));
+        editorA?.setContent(html);
+        editorB?.setContent(html);
+        window.tinymce?.triggerSave?.();
         return true;
       }
 
       const iframe = document.querySelector('#wp-manga-chapter-content_ifr');
       const body = iframe?.contentDocument?.body;
       if (body) {
-        body.innerHTML = content.replace(/\n/g, '<br />');
+        body.innerHTML = html;
         body.dispatchEvent(new Event('input', { bubbles: true }));
+        const textareas = [
+          'textarea[name="wp-manga-chapter-content"]',
+          '#wp-manga-chapter-content',
+          'textarea[name="wp-manga-chapter-content-wp-editor"]',
+          '#wp-manga-chapter-content-wp-editor'
+        ];
+        textareas.forEach((selector) => {
+          Dom.fillInput(selector, content);
+        });
         return true;
       }
 
@@ -924,7 +935,9 @@
 
     const filledTitle = tryFill(nameSelectors, chapter.title);
     tryFill(indexSelectors, chapter.index || '');
-    const filledContent = tryFill(contentSelectors, chapter.content) || fillEditorContent(chapter.content);
+    const filledEditorContent = fillEditorContent(chapter.content);
+    const filledTextareaContent = tryFill(contentSelectors, chapter.content);
+    const filledContent = filledEditorContent || filledTextareaContent;
 
     if (!filledTitle || !filledContent) {
       throw new Error('chapter form selector mismatch');
