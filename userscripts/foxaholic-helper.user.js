@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Foxaholic Helper
 // @namespace    https://github.com/shixq/syn-novel
-// @version      1.1.0
+// @version      1.2.1
 // @description  私域小说平台辅助：状态扫描、映射配置、章节导入填充
 // @match        https://18.foxaholic.com/wp-admin/*
+// @match        https://www.novelupdates.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        unsafeWindow
@@ -366,8 +367,11 @@
         button.style.border = '1px solid #cfd8dc';
         button.style.borderRadius = '6px';
         button.style.background = '#fff';
+        button.style.color = '#263238';
         button.style.cursor = 'pointer';
         button.style.fontSize = '12px';
+        button.style.whiteSpace = 'nowrap';
+        button.style.lineHeight = '1.4';
         if (opts.primary) {
           button.style.background = '#1976d2';
           button.style.color = '#fff';
@@ -646,11 +650,105 @@
     };
   };
 
+  const installFoxDataBridge = () => {
+    const globalRoot = getGlobalRoot();
+    const bridge = globalRoot.SynNovelFoxBridge || {};
+
+    bridge.exportData = async () => {
+      if (!Storage || typeof Storage.get !== 'function') {
+        return null;
+      }
+      return Storage.get();
+    };
+
+    bridge.getMeta = () => ({
+      source: 'foxaholic-helper',
+      version: '1.2.1',
+      host: location.host
+    });
+
+    globalRoot.SynNovelFoxBridge = bridge;
+  };
+
+  const notifyFoxDataUpdated = (reason) => {
+    window.dispatchEvent(new CustomEvent('synnovel:fox-data-updated', {
+      detail: {
+        reason: reason || 'unknown',
+        at: new Date().toISOString()
+      }
+    }));
+  };
+
+  const normalizeConfigAliases = (aliases) => Array.from(new Set((aliases || [])
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)));
+
+  const findNovelSlugById = (novels, postId) => {
+    const targetId = Number.parseInt(postId, 10);
+    if (!targetId) {
+      return '';
+    }
+    const matched = Object.entries(novels || {}).find(([, novel]) => Number.parseInt(novel?.id, 10) === targetId);
+    return matched ? matched[0] : '';
+  };
+
+  const findConfigKeyByPostId = (novelConfigs, postId) => {
+    const targetId = Number.parseInt(postId, 10);
+    if (!targetId) {
+      return '';
+    }
+    const matched = Object.entries(novelConfigs || {}).find(([, config]) => Number.parseInt(config?.postId, 10) === targetId);
+    return matched ? matched[0] : '';
+  };
+
+  const migrateConfigToSlug = (data, postId, targetSlug, titleFallback = '') => {
+    data.novelConfigs = data.novelConfigs || {};
+    if (!targetSlug) {
+      return;
+    }
+
+    const aliases = normalizeConfigAliases([
+      findConfigKeyByPostId(data.novelConfigs, postId),
+      slugify(titleFallback)
+    ]);
+
+    const sourceKey = aliases.find((key) => key && key !== targetSlug && data.novelConfigs[key]);
+    const targetId = Number.parseInt(postId, 10);
+
+    if (sourceKey && !data.novelConfigs[targetSlug]) {
+      data.novelConfigs[targetSlug] = {
+        ...data.novelConfigs[sourceKey],
+        ...(targetId ? { postId: targetId } : {})
+      };
+      delete data.novelConfigs[sourceKey];
+      return;
+    }
+
+    if (data.novelConfigs[targetSlug] && targetId) {
+      data.novelConfigs[targetSlug] = {
+        ...data.novelConfigs[targetSlug],
+        postId: targetId
+      };
+    }
+  };
+
   const saveNovelData = async (record) => {
     const data = await Storage.get();
     data.novels = data.novels || {};
+
+    const targetId = Number.parseInt(record?.id, 10);
+    const duplicateKeys = Object.entries(data.novels)
+      .filter(([slug, novel]) => slug !== record.slug && targetId && Number.parseInt(novel?.id, 10) === targetId)
+      .map(([slug]) => slug);
+    duplicateKeys.forEach((slug) => {
+      delete data.novels[slug];
+    });
+
     data.novels[record.slug] = record;
+    migrateConfigToSlug(data, record.id, record.slug, record.title);
+
     await Storage.set(data);
+    notifyFoxDataUpdated('novel-updated');
     return record;
   };
 
@@ -722,12 +820,13 @@
   };
 
   const scanSelectedNovels = async () => {
-    let selectedIds = await ensureSelection();
-    if (!selectedIds.length) {
-      selectedIds = collectSelectedNovelIdsFromTable();
-      if (selectedIds.length) {
-        await persistSelection(selectedIds);
-      }
+    const idsFromTable = collectSelectedNovelIdsFromTable();
+    let selectedIds = idsFromTable;
+
+    if (selectedIds.length) {
+      await persistSelection(selectedIds);
+    } else {
+      selectedIds = await ensureSelection();
     }
 
     if (!selectedIds.length) {
@@ -792,6 +891,72 @@
     UI.toast('已清空选择');
   };
 
+  const bulkConfigureSelectedNovels = async () => {
+    const idsFromTable = collectSelectedNovelIdsFromTable();
+    const selectedIds = idsFromTable.length ? idsFromTable : await ensureSelection();
+
+    if (!selectedIds.length) {
+      UI.toast('请先勾选要配置的小说', 'warn');
+      return;
+    }
+
+    const groupInput = prompt('批量 NU Group 名称（留空=不覆盖已有）', '');
+    if (groupInput === null) {
+      return;
+    }
+
+    const releaseInput = prompt('批量 Release 格式（chapter/c）', 'chapter');
+    if (releaseInput === null) {
+      return;
+    }
+
+    const releaseFormat = releaseInput.trim() === 'c' ? 'c' : 'chapter';
+    const groupName = groupInput.trim();
+
+    const rows = [...document.querySelectorAll('#the-list tr[id^="post-"]')];
+    const rowMap = new Map(rows.map((row) => {
+      const meta = getRowNovelMeta(row);
+      return [meta.id, meta];
+    }));
+
+    const data = await Storage.get();
+    data.novels = data.novels || {};
+    data.novelConfigs = data.novelConfigs || {};
+
+    let updated = 0;
+    selectedIds.forEach((novelId) => {
+      const meta = rowMap.get(novelId);
+      if (!meta) {
+        return;
+      }
+
+      const configKey = findNovelSlugById(data.novels, novelId)
+        || findConfigKeyByPostId(data.novelConfigs, novelId)
+        || meta.slug
+        || `post-${novelId}`;
+
+      const prev = data.novelConfigs[configKey] || {};
+      data.novelConfigs[configKey] = {
+        ...prev,
+        nuSeriesName: String(prev.nuSeriesName || meta.title || `post-${novelId}`).trim(),
+        nuGroupName: groupName || String(prev.nuGroupName || '').trim(),
+        releaseFormat,
+        postId: novelId
+      };
+      updated += 1;
+    });
+
+    await Storage.set(data);
+    notifyFoxDataUpdated('bulk-config-updated');
+
+    if (!groupName) {
+      UI.toast(`批量映射完成 ${updated} 本（未覆盖 Group）`, 'info', 4200);
+      return;
+    }
+
+    UI.toast(`批量映射完成 ${updated} 本，Group=${groupName}`, 'info', 4200);
+  };
+
   const openConfigForCurrentNovel = async () => {
     const postId = Number.parseInt(new URLSearchParams(location.search).get('post') || '', 10);
     if (!postId) {
@@ -804,7 +969,21 @@
 
     const data = await Storage.get();
     data.novelConfigs = data.novelConfigs || {};
-    const prev = data.novelConfigs[inferredSlug] || {};
+
+    const slugFromNovels = findNovelSlugById(data.novels || {}, postId);
+    const slugFromConfigById = findConfigKeyByPostId(data.novelConfigs, postId);
+    const slugFromPermalink = extractSlugAndBaseUrl(document).slug;
+
+    const aliasKeys = normalizeConfigAliases([slugFromNovels, slugFromConfigById, slugFromPermalink, inferredSlug]);
+    const primaryKey = aliasKeys[0] || inferredSlug || `post-${postId}`;
+
+    const prev = aliasKeys.reduce((acc, key) => {
+      const config = data.novelConfigs[key];
+      if (!config || typeof config !== 'object') {
+        return acc;
+      }
+      return { ...acc, ...config };
+    }, data.novelConfigs[primaryKey] || {});
 
     const nuSeriesName = prompt('NU 小说名称', prev.nuSeriesName || title);
     if (nuSeriesName === null) {
@@ -821,14 +1000,23 @@
       return;
     }
 
-    data.novelConfigs[inferredSlug] = {
+    data.novelConfigs[primaryKey] = {
+      ...prev,
       nuSeriesName: nuSeriesName.trim(),
       nuGroupName: nuGroupName.trim(),
-      releaseFormat: releaseFormat.trim() === 'c' ? 'c' : 'chapter'
+      releaseFormat: releaseFormat.trim() === 'c' ? 'c' : 'chapter',
+      postId
     };
 
+    aliasKeys.forEach((key) => {
+      if (key !== primaryKey) {
+        delete data.novelConfigs[key];
+      }
+    });
+
     await Storage.set(data);
-    UI.toast(`配置已保存：${inferredSlug}`);
+    notifyFoxDataUpdated('config-updated');
+    UI.toast(`配置已保存：${primaryKey}`);
   };
 
   const autoScanCurrentNovel = async () => {
@@ -1140,6 +1328,7 @@
       title: 'SynNovel 扫描助手',
       actions: [
         { label: '🔄 扫描选中', primary: true, onClick: () => scanSelectedNovels() },
+        { label: '⚙️ 批量映射', onClick: () => bulkConfigureSelectedNovels() },
         { label: '✅ 全选活跃', onClick: () => selectActiveRows() },
         { label: '🧹 清除选择', onClick: () => clearSelection() }
       ]
@@ -1172,14 +1361,19 @@
 
   const bootstrap = async () => {
     const targetPage = isNovelListPage() || isNovelEditPage() || isTextChapterPage();
-    if (!targetPage) {
-      return;
-    }
 
     const { ready: sharedReady, usedFallback } = await ensureSharedModules();
     if (!sharedReady) {
       console.warn('[SynNovel] shared modules missing');
-      showMissingSharedNotice();
+      if (targetPage) {
+        showMissingSharedNotice();
+      }
+      return;
+    }
+
+    installFoxDataBridge();
+
+    if (!targetPage) {
       return;
     }
 

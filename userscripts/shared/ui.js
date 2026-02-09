@@ -28,8 +28,11 @@
     button.style.border = '1px solid #cfd8dc';
     button.style.borderRadius = '6px';
     button.style.background = '#fff';
+    button.style.color = '#263238';
     button.style.cursor = 'pointer';
     button.style.fontSize = '12px';
+    button.style.whiteSpace = 'nowrap';
+    button.style.lineHeight = '1.4';
     if (opts.primary) {
       button.style.background = '#1976d2';
       button.style.color = '#fff';
