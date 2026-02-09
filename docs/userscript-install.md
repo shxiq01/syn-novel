@@ -9,7 +9,9 @@
 1. 安装并启用：`userscripts/foxaholic-helper.user.js`
 2. 安装并启用：`userscripts/novelupdates-helper.user.js`
 
-> 说明：两个主脚本已支持“单文件模式”，即使未单独安装 `userscripts/shared/*.js` 也可运行。
+> 说明：两个主脚本已支持“单文件模式”。
+>
+> 跨站同步（Fox → NovelUpdates）现通过内置桥接完成：`foxaholic-helper.user.js` 会在 NU 页面暴露 `SynNovelFoxBridge`，`novelupdates-helper.user.js` 可点击 `🧲 拉取私域` 手动拉取，或在页面初始化时自动尝试拉取。
 
 ## 3. 可选：高级 shared 模式（非必需）
 
@@ -30,7 +32,7 @@
 ### 3.1 小说列表页批量扫描
 - 进入 `/wp-admin/edit.php?post_type=wp-manga`
 - 勾选小说后点击 `扫描选中`
-- 扫描结果会写入 `synNovelData.novels`
+- 扫描结果会写入 Fox 脚本存储，并通过跨站桥接供 NU 脚本拉取
 
 ### 3.2 小说编辑页映射配置
 - 进入某本小说编辑页 `/wp-admin/post.php?post=<id>&action=edit`
@@ -43,13 +45,19 @@
 - 每次填充后手动点击平台 `Create Chapter`
 - 再点击 `填充下一章` 继续
 
+### 3.4 NovelUpdates 拉取私域数据
+- 先在 Fox 页面完成 `扫描选中` 或编辑页 `立即扫描`
+- 回到 NU 页面（建议强刷一次）
+- 点击面板 `🧲 拉取私域`，确认提示“已拉取私域数据：X 本”
+- 再点击 `📡 同步已发布`
+
 ## 5. 数据位置
 - `GM storage key`: `synNovelData`
 - 核心结构：`novels` / `novelConfigs` / `publishedReleases` / `meta`
 
 ## 6. 故障排查
 - 面板未显示：确认脚本匹配地址正确、共享模块已先加载
-- 扫描为空：检查登录状态和后台章节 DOM 是否变更
+- 扫描为空：检查登录状态和后台章节 DOM 是否变更；并在 NU 页点击 `🧲 拉取私域`
 - 填充失败：检查 Text Chapter 表单字段选择器是否变化
 
 ## 7. 快速自检（页面无任何按钮时）
