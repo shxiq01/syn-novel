@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelUpdates Release Helper
 // @namespace    https://github.com/shixq/syn-novel
-// @version      1.3.4
+// @version      1.3.8
 // @description  同步已发布章节并在 Add Release 页面自动填表
 // @match        https://www.novelupdates.com/*
 // @grant        GM_getValue
@@ -21,6 +21,7 @@
   let Dom;
   let pendingPanelRef = null;
   let commonPanelRef = null;
+  let submitReconcileTick = 0;
 
   const initFallbackShared = () => {
     const globalRoot = getGlobalRoot();
@@ -394,6 +395,8 @@
   const isAddReleasePage = () => location.pathname.startsWith('/add-release');
 
   const PENDING_SUBMIT_PATH = 'meta.pendingSubmit';
+  const SUBMIT_LOCKS_PATH = 'meta.submitLocks';
+  const SUBMIT_LOCK_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
   const toPendingSubmitToken = (payload) => {
     if (!payload?.slug || !payload?.releaseKey) {
@@ -442,6 +445,116 @@
     await Storage.update(PENDING_SUBMIT_PATH, null);
   };
 
+  const readSubmitLocks = async () => {
+    const raw = await Storage.getPath(SUBMIT_LOCKS_PATH, {});
+    const source = raw && typeof raw === 'object' ? raw : {};
+    const now = Date.now();
+    const cleaned = {};
+    let changed = false;
+
+    Object.entries(source).forEach(([token, value]) => {
+      const slug = String(value?.slug || '').trim();
+      const releaseKey = String(value?.releaseKey || '').trim().toLowerCase();
+      const normalizedToken = slug && releaseKey ? `${slug}:${releaseKey}` : '';
+      const atText = String(value?.at || '').trim();
+      const atTs = Date.parse(atText || '');
+
+      if (!normalizedToken) {
+        changed = true;
+        return;
+      }
+
+      if (atTs && now - atTs > SUBMIT_LOCK_MAX_AGE_MS) {
+        changed = true;
+        return;
+      }
+
+      cleaned[normalizedToken] = {
+        ...(value && typeof value === 'object' ? value : {}),
+        slug,
+        releaseKey,
+        at: atText || new Date().toISOString()
+      };
+
+      if (token !== normalizedToken) {
+        changed = true;
+      }
+    });
+
+    if (changed) {
+      await Storage.update(SUBMIT_LOCKS_PATH, cleaned);
+    }
+
+    return cleaned;
+  };
+
+  const setSubmitLock = async (payload, { reason = 'submit-attempt' } = {}) => {
+    const token = toPendingSubmitToken(payload);
+    if (!token) {
+      return '';
+    }
+
+    const locks = await readSubmitLocks();
+    locks[token] = {
+      slug: String(payload.slug || '').trim(),
+      releaseKey: String(payload.releaseKey || '').trim().toLowerCase(),
+      releaseText: String(payload.releaseText || '').trim(),
+      novelTitle: String(payload.novelTitle || '').trim(),
+      reason,
+      at: new Date().toISOString()
+    };
+    await Storage.update(SUBMIT_LOCKS_PATH, locks);
+    return token;
+  };
+
+  const removeSubmitLock = async (payload) => {
+    const token = toPendingSubmitToken(payload);
+    if (!token) {
+      return false;
+    }
+
+    const locks = await readSubmitLocks();
+    if (!locks[token]) {
+      return false;
+    }
+
+    delete locks[token];
+    await Storage.update(SUBMIT_LOCKS_PATH, locks);
+    return true;
+  };
+
+  const clearSubmitLocks = async () => {
+    await Storage.update(SUBMIT_LOCKS_PATH, {});
+  };
+
+  const clearSubmitLocksByPublishedKeys = async (slug, publishedSet) => {
+    const targetSlug = String(slug || '').trim();
+    if (!targetSlug || !(publishedSet instanceof Set) || !publishedSet.size) {
+      return 0;
+    }
+
+    const locks = await readSubmitLocks();
+    let removed = 0;
+
+    Object.entries(locks).forEach(([token, value]) => {
+      const lockSlug = String(value?.slug || '').trim();
+      const lockReleaseKey = String(value?.releaseKey || '').trim().toLowerCase();
+      if (lockSlug !== targetSlug || !lockReleaseKey) {
+        return;
+      }
+      if (publishedSet.has(lockReleaseKey)) {
+        delete locks[token];
+        removed += 1;
+      }
+    });
+
+    if (removed > 0) {
+      await Storage.update(SUBMIT_LOCKS_PATH, locks);
+    }
+
+    return removed;
+  };
+
   const hasSubmitSuccessHint = () => {
     const params = new URLSearchParams(location.search || '');
     const successParamMatched = ['success', 'submitted', 'result', 'status']
@@ -471,10 +584,141 @@
     const bodyText = String(document.body?.innerText || '').replace(/\s+/g, ' ').trim();
     textSegments.push(bodyText.slice(0, 2000));
 
-    const successPattern = /(release.{0,60}(submitted|added|accepted|received)|thank\s*you.{0,40}(submission|release)|successfully.{0,40}(submitted|added))/i;
+    const successPattern = /(release.{0,60}(submitted|added|accepted|received)|thank\s*you.{0,60}(submission|release)|successfully.{0,60}(submitted|added)|your\s*release\s*has\s*been\s*(submitted|received|added)|submission\s*(received|accepted|successful))/i;
     const errorPattern = /(required|invalid|error|failed|duplicate|already\s+exist)/i;
 
     return textSegments.some((segment) => successPattern.test(segment) && !errorPattern.test(segment));
+  };
+
+  const hasSubmitErrorHint = () => {
+    const selectors = [
+      '.alert-danger',
+      '.notice-error',
+      '.error',
+      '.message.error',
+      '#message',
+      '.entry-content .alert',
+      '.entry-content .notice'
+    ];
+
+    const textSegments = selectors
+      .flatMap((selector) => [...document.querySelectorAll(selector)])
+      .map((node) => String(node.textContent || '').replace(/\s+/g, ' ').trim())
+      .filter(Boolean);
+
+    const bodyText = String(document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+    textSegments.push(bodyText.slice(0, 2400));
+
+    const errorPattern = /(required|invalid|error|failed|duplicate|already\s+exist|please\s+select|must\s+be\s+selected|captcha|rate\s*limit|too\s*many\s*requests)/i;
+    return textSegments.some((segment) => errorPattern.test(segment));
+  };
+
+  const registerPendingSubmitOnForm = async () => {
+    if (!isAddReleasePage()) {
+      return;
+    }
+
+    const pending = await readPendingSubmit();
+    if (pending) {
+      return;
+    }
+
+    const link = String(readFirstValue(['#arlink', 'input[name="arlink"]', 'input[name="url"]', 'input[name="link"]', '#link']) || '').trim();
+    if (!link) {
+      return;
+    }
+
+    const pendingList = await buildPendingList();
+    const matched = pendingList.find((item) => String(item.link || '').trim() === link)
+      || pendingList.find((item) => {
+        const itemLink = String(item.link || '').trim();
+        if (!itemLink) {
+          return false;
+        }
+        return link.includes(itemLink) || itemLink.includes(link);
+      });
+
+    if (matched) {
+      await setPendingSubmit(matched);
+      Logger.info('pending submit auto-registered from current form', {
+        slug: matched.slug,
+        releaseKey: matched.releaseKey
+      });
+    }
+  };
+
+  const reconcileAfterSubmitAttempt = async ({ refreshPanel = true } = {}) => {
+    const tick = ++submitReconcileTick;
+    const delays = [900, 2200, 4200];
+    let removed = false;
+
+    await registerPendingSubmitOnForm();
+    const pendingAtSubmit = await readPendingSubmit();
+    if (pendingAtSubmit) {
+      await setSubmitLock(pendingAtSubmit, { reason: 'submit-attempt' });
+    }
+
+    for (const delay of delays) {
+      await sleep(delay);
+      if (tick !== submitReconcileTick) {
+        return;
+      }
+
+      removed = await reconcilePendingSubmitAfterSuccess();
+      if (removed) {
+        break;
+      }
+    }
+
+    if (!removed) {
+      const pendingSubmit = await readPendingSubmit();
+      if (pendingSubmit) {
+        if (hasSubmitErrorHint()) {
+          UI.toast('检测到提交错误提示，本条未置灰，请修正表单后重试', 'error', 6200);
+        } else {
+          await clearPendingSubmit();
+          UI.toast('未检测到提交成功，已置灰当前条目避免重复提交；后续可同步已发布确认', 'warn', 6200);
+        }
+      }
+    }
+
+    if (refreshPanel && isAddReleasePage()) {
+      renderPendingPanel().catch((error) => Logger.error('refresh pending panel after submit watch failed', error));
+    }
+  };
+
+  const installSubmitWatcher = () => {
+    if (!isAddReleasePage()) {
+      return;
+    }
+
+    const forms = [...document.querySelectorAll('form')];
+    const targetForm = forms.find((form) => {
+      const submitControls = [...form.querySelectorAll('button[type="submit"], input[type="submit"]')];
+      return submitControls.some((control) => /submit/i.test(String(control.value || control.textContent || '')));
+    }) || forms[0];
+
+    if (!targetForm || targetForm.dataset.synnovelSubmitWatcherBound === '1') {
+      return;
+    }
+
+    targetForm.dataset.synnovelSubmitWatcherBound = '1';
+    targetForm.addEventListener('submit', () => {
+      registerPendingSubmitOnForm().catch((error) => Logger.warn('register pending on submit failed', error));
+      reconcileAfterSubmitAttempt({ refreshPanel: true }).catch((error) => Logger.warn('submit reconcile watch failed', error));
+    });
+
+    const submitButtons = [...targetForm.querySelectorAll('button[type="submit"], input[type="submit"]')];
+    submitButtons.forEach((button) => {
+      if (button.dataset.synnovelSubmitWatcherBound === '1') {
+        return;
+      }
+      button.dataset.synnovelSubmitWatcherBound = '1';
+      button.addEventListener('click', () => {
+        registerPendingSubmitOnForm().catch((error) => Logger.warn('register pending on click failed', error));
+        reconcileAfterSubmitAttempt({ refreshPanel: true }).catch((error) => Logger.warn('submit reconcile watch failed', error));
+      });
+    });
   };
 
   const reconcilePendingSubmitAfterSuccess = async () => {
@@ -498,6 +742,7 @@
     }
 
     await Storage.addPublishedRelease(pendingSubmit.slug, pendingSubmit.releaseKey);
+    await removeSubmitLock(pendingSubmit);
     await clearPendingSubmit();
     UI.toast(`提交成功，已移除：${pendingSubmit.novelTitle || pendingSubmit.slug} ${pendingSubmit.releaseText || pendingSubmit.releaseKey}`, 'info', 5200);
     return true;
@@ -593,6 +838,156 @@
     .replace(/[^a-z0-9]+/g, ' ')
     .trim();
 
+  const normalizeSearchKeyword = (value) => String(value || '')
+    .replace(/[‘’]/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/[‐‑‒–—―]/g, '-')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const buildSeriesSearchKeywords = (seriesName) => {
+    const original = String(seriesName || '').trim();
+    if (!original) {
+      return [];
+    }
+
+    const normalized = normalizeSearchKeyword(original);
+    const alnum = normalized
+      .replace(/[^a-zA-Z0-9\s]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const tokens = alnum.toLowerCase().split(' ').filter(Boolean);
+    const reduced = tokens.length > 6 ? tokens.slice(0, tokens.length - 1).join(' ') : '';
+    const reduced2 = tokens.length > 8 ? tokens.slice(0, tokens.length - 2).join(' ') : '';
+
+    return Array.from(new Set([
+      original,
+      normalized,
+      alnum,
+      reduced,
+      reduced2
+    ].map((item) => String(item || '').trim()).filter(Boolean)));
+  };
+
+  const normalizeNuSlugInput = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) {
+      return '';
+    }
+
+    const fromPath = (pathname) => {
+      const cleaned = String(pathname || '').replace(/[?#].*$/, '').replace(/^\/+|\/+$/g, '');
+      const matched = cleaned.match(/^series\/(.+)$/i);
+      return matched ? String(matched[1] || '').replace(/^\/+|\/+$/g, '') : cleaned;
+    };
+
+    if (/^https?:\/\//i.test(raw)) {
+      try {
+        const url = new URL(raw);
+        const slugFromSeries = url.pathname.match(/\/series\/([^/]+)/i)?.[1] || '';
+        return slugFromSeries || fromPath(url.pathname);
+      } catch {
+        return fromPath(raw);
+      }
+    }
+
+    if (raw.startsWith('/')) {
+      return fromPath(raw);
+    }
+
+    return fromPath(raw);
+  };
+
+  const NU_REQUEST_GAP_MS = 560;
+  let nuLastRequestAt = 0;
+
+  const sleepNuRequestGap = async () => {
+    const elapsed = Date.now() - nuLastRequestAt;
+    if (elapsed < NU_REQUEST_GAP_MS) {
+      await sleep(NU_REQUEST_GAP_MS - elapsed);
+    }
+    nuLastRequestAt = Date.now();
+  };
+
+  const parseRetryAfterMs = (response, fallbackMs = 1200) => {
+    const header = String(response?.headers?.get('Retry-After') || '').trim();
+    if (!header) {
+      return fallbackMs;
+    }
+
+    const seconds = Number.parseInt(header, 10);
+    if (Number.isFinite(seconds) && seconds > 0) {
+      return Math.max(seconds * 1000, fallbackMs);
+    }
+
+    const retryAt = Date.parse(header);
+    if (!Number.isNaN(retryAt)) {
+      return Math.max(retryAt - Date.now(), fallbackMs);
+    }
+
+    return fallbackMs;
+  };
+
+  const fetchTextWithRetry = async (url, init = {}, options = {}) => {
+    const {
+      label = String(url || ''),
+      maxAttempts = 4,
+      retryBaseMs = 1000,
+      retryStatuses = [429, 502, 503, 504]
+    } = options;
+
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      await sleepNuRequestGap();
+
+      try {
+        const response = await fetch(url, init);
+
+        if (response.ok) {
+          return {
+            status: response.status,
+            text: await response.text(),
+            headers: response.headers
+          };
+        }
+
+        if (retryStatuses.includes(response.status) && attempt < maxAttempts) {
+          const fallbackDelay = retryBaseMs * attempt;
+          const retryDelay = response.status === 429
+            ? parseRetryAfterMs(response, fallbackDelay)
+            : fallbackDelay;
+
+          Logger.warn('NU request retrying due to status', {
+            label,
+            status: response.status,
+            attempt,
+            retryDelay
+          });
+          await sleep(retryDelay);
+          continue;
+        }
+
+        lastError = new Error(`${label} failed: ${response.status}`);
+      } catch (error) {
+        lastError = error;
+        if (attempt < maxAttempts) {
+          const retryDelay = retryBaseMs * attempt;
+          Logger.warn('NU request retrying after network error', {
+            label,
+            attempt,
+            retryDelay,
+            error
+          });
+          await sleep(retryDelay);
+          continue;
+        }
+      }
+    }
+
+    throw lastError || new Error(`${label} failed`);
+  };
+
   const sortReleaseKeys = (releaseKeys) => Array.from(new Set(releaseKeys || [])).sort((a, b) => {
     const ai = Number.parseInt(String(a).replace(/^c/i, ''), 10);
     const bi = Number.parseInt(String(b).replace(/^c/i, ''), 10);
@@ -653,18 +1048,60 @@
     return sortReleaseKeys(releases);
   };
 
+  const tokenizeTitleKey = (value) => String(value || '').split(/\s+/).filter(Boolean);
+
+  const scoreTitleMatch = (queryKey, candidateKey) => {
+    if (!queryKey || !candidateKey) {
+      return 0;
+    }
+
+    if (queryKey === candidateKey) {
+      return 3;
+    }
+
+    if (candidateKey.includes(queryKey) || queryKey.includes(candidateKey)) {
+      const maxLen = Math.max(queryKey.length, candidateKey.length) || 1;
+      const lenDiff = Math.abs(queryKey.length - candidateKey.length);
+      return 2 - (lenDiff / maxLen) * 0.4;
+    }
+
+    const queryTokens = tokenizeTitleKey(queryKey);
+    const candidateTokens = tokenizeTitleKey(candidateKey);
+    if (!queryTokens.length || !candidateTokens.length) {
+      return 0;
+    }
+
+    const querySet = new Set(queryTokens);
+    const candidateSet = new Set(candidateTokens);
+    let common = 0;
+    querySet.forEach((token) => {
+      if (candidateSet.has(token)) {
+        common += 1;
+      }
+    });
+
+    const overlap = common / Math.max(querySet.size, candidateSet.size);
+    const startsBonus = (candidateKey.startsWith(queryTokens[0]) || queryKey.startsWith(candidateTokens[0])) ? 0.12 : 0;
+    return overlap + startsBonus;
+  };
+
   const parseSeriesSearchCandidates = (html, queryText) => {
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const queryKey = normalizeTitleKey(queryText);
 
-    const candidates = [...doc.querySelectorAll('.change_list')].map((node) => {
+    const nodes = [...new Set([
+      ...doc.querySelectorAll('.change_list'),
+      ...doc.querySelectorAll('[onclick*="changeitem("]')
+    ])];
+
+    const candidates = nodes.map((node) => {
       const text = (node.textContent || '').trim();
       const onclick = node.getAttribute('onclick') || '';
-      const matched = onclick.match(/changeitem\('\d+','(\d+)','title'/i);
+      const matched = onclick.match(/changeitem\((['"])(.*?)\1\s*,\s*(['"])(.*?)\3\s*,\s*(['"])title\5/i);
       return {
         text,
         textKey: normalizeTitleKey(text),
-        seriesId: matched ? matched[1] : ''
+        seriesId: matched ? String(matched[4] || '').trim() : ''
       };
     }).filter((item) => item.seriesId);
 
@@ -677,47 +1114,79 @@
       return exact;
     }
 
-    const contains = candidates.find((item) => {
-      if (!item.textKey || !queryKey) {
-        return false;
-      }
-      if (queryKey.length < 6 || item.textKey.length < 6) {
-        return false;
-      }
-      return item.textKey.includes(queryKey) || queryKey.includes(item.textKey);
-    });
+    const scored = candidates
+      .map((item) => ({
+        ...item,
+        score: scoreTitleMatch(queryKey, item.textKey)
+      }))
+      .sort((a, b) => b.score - a.score);
 
-    return contains || null;
+    const best = scored[0];
+    if (!best || best.score < 0.45) {
+      return null;
+    }
+
+    return best;
   };
 
-  const resolveSeriesInfoByName = async (seriesName) => {
-    const keyword = String(seriesName || '').trim();
-    if (!keyword) {
+  const fetchSeriesSearchCandidates = async (keyword) => {
+    const query = String(keyword || '').trim();
+    if (!query) {
       return null;
     }
 
     const form = new URLSearchParams();
     form.set('action', 'nd_ajaxsearch');
-    form.set('str', keyword);
+    form.set('str', query);
     form.set('strID', '100');
     form.set('strType', 'series');
 
-    const response = await fetch('https://www.novelupdates.com/wp-admin/admin-ajax.php', {
+    const result = await fetchTextWithRetry('https://www.novelupdates.com/wp-admin/admin-ajax.php', {
       method: 'POST',
       credentials: 'include',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
       },
       body: form.toString()
+    }, {
+      label: 'nd_ajaxsearch',
+      maxAttempts: 4,
+      retryBaseMs: 900
     });
 
-    if (!response.ok) {
-      throw new Error(`nd_ajaxsearch failed: ${response.status}`);
+    const payload = result.text;
+    const html = payload.endsWith('0') ? payload.slice(0, -1) : payload;
+    return parseSeriesSearchCandidates(html, query);
+  };
+
+  const resolveSeriesInfoByName = async (seriesName) => {
+    const keywords = buildSeriesSearchKeywords(seriesName);
+    for (const keyword of keywords) {
+      try {
+        const matched = await fetchSeriesSearchCandidates(keyword);
+        if (matched?.seriesId) {
+          return {
+            ...matched,
+            matchedBy: keyword
+          };
+        }
+      } catch (error) {
+        Logger.warn('resolve series keyword lookup failed', {
+          seriesName,
+          keyword,
+          error
+        });
+      }
     }
 
-    const payload = await response.text();
-    const html = payload.endsWith('0') ? payload.slice(0, -1) : payload;
-    return parseSeriesSearchCandidates(html, keyword);
+    if (keywords.length > 1) {
+      Logger.warn('resolve series by name no candidate', {
+        source: String(seriesName || '').trim(),
+        keywords
+      });
+    }
+
+    return null;
   };
 
   const extractNuSlugFromHtml = (html) => {
@@ -727,27 +1196,55 @@
     return matched ? matched[1] : '';
   };
 
-  const isNu404Page = (html) => /Error\s*404\s*-\s*page\s*not\s*found/i.test(String(html || ''));
+  const isNu404Page = (html) => {
+    const text = String(html || '');
+    return /(error\s*404|page\s*not\s*found|the\s*page\s*you\s*requested\s*could\s*not\s*be\s*found|nothing\s*found)/i.test(text);
+  };
+
+  const isLikelyNuSeriesPage = (html) => {
+    const doc = new DOMParser().parseFromString(String(html || ''), 'text/html');
+    if (doc.querySelector('#mypostid')) {
+      return true;
+    }
+
+    if (doc.querySelector('link[rel="canonical"][href*="/series/"]')) {
+      const chapterMarkers = [
+        '.chp-release',
+        '.serieseditimg',
+        '#myTable',
+        '.serieimg',
+        '.seriestitlenu'
+      ];
+      return chapterMarkers.some((selector) => doc.querySelector(selector));
+    }
+
+    return false;
+  };
 
   const resolveScanTarget = async ({ nuSlug, nuSeriesName, novelTitle }) => {
     const queryName = String(nuSeriesName || novelTitle || '').trim();
+    const normalizedNuSlug = normalizeNuSlugInput(nuSlug);
 
-    if (nuSlug) {
+    if (normalizedNuSlug) {
       try {
-        const slugUrl = `https://www.novelupdates.com/series/${nuSlug}/`;
-        const slugHtml = await fetch(slugUrl, { credentials: 'include' }).then((r) => r.text());
-        if (!isNu404Page(slugHtml)) {
+        const slugUrl = `https://www.novelupdates.com/series/${normalizedNuSlug}/`;
+        const slugHtml = await fetchTextWithRetry(slugUrl, { credentials: 'include' }, {
+          label: `series:${normalizedNuSlug}`,
+          maxAttempts: 4,
+          retryBaseMs: 900
+        }).then((result) => result.text);
+        if (!isNu404Page(slugHtml) && isLikelyNuSeriesPage(slugHtml)) {
           const resolvedSlug = extractNuSlugFromHtml(slugHtml);
           return {
             html: slugHtml,
             source: 'nuSlug',
             seriesId: '',
-            nuSlug: resolvedSlug || nuSlug,
-            seriesName: queryName || nuSlug
+            nuSlug: resolvedSlug || normalizedNuSlug,
+            seriesName: queryName || normalizedNuSlug
           };
         }
       } catch (error) {
-        Logger.warn('resolve series by nuSlug failed, fallback to name', nuSlug, error);
+        Logger.warn('resolve series by nuSlug failed, fallback to name', normalizedNuSlug, error);
       }
     }
 
@@ -756,24 +1253,58 @@
         const matched = await resolveSeriesInfoByName(queryName);
         if (matched?.seriesId) {
           const detailUrl = `https://www.novelupdates.com/?p=${matched.seriesId}`;
-          const detailHtml = await fetch(detailUrl, { credentials: 'include' }).then((r) => r.text());
-          if (!isNu404Page(detailHtml)) {
+          const detailHtml = await fetchTextWithRetry(detailUrl, { credentials: 'include' }, {
+            label: `seriesDetail:${matched.seriesId}`,
+            maxAttempts: 4,
+            retryBaseMs: 900
+          }).then((result) => result.text);
+          if (!isNu404Page(detailHtml) && isLikelyNuSeriesPage(detailHtml)) {
             const resolvedSlug = extractNuSlugFromHtml(detailHtml);
             return {
               html: detailHtml,
               source: 'nd_ajaxsearch',
               seriesId: matched.seriesId,
-              nuSlug: resolvedSlug || nuSlug || '',
-              seriesName: matched.text || queryName
+              nuSlug: resolvedSlug || normalizedNuSlug || '',
+              seriesName: matched.text || queryName,
+              matchedBy: matched.matchedBy || queryName
             };
           }
         }
       } catch (error) {
         Logger.warn('resolve series by name failed', queryName, error);
       }
+
+      const fallbackNameSlug = normalizeNuSlugInput(queryName);
+      if (fallbackNameSlug && fallbackNameSlug !== normalizedNuSlug) {
+        try {
+          const fallbackUrl = `https://www.novelupdates.com/series/${fallbackNameSlug}/`;
+          const fallbackHtml = await fetchTextWithRetry(fallbackUrl, { credentials: 'include' }, {
+            label: `series:fallbackNameSlug:${fallbackNameSlug}`,
+            maxAttempts: 3,
+            retryBaseMs: 900
+          }).then((result) => result.text);
+
+          if (!isNu404Page(fallbackHtml) && isLikelyNuSeriesPage(fallbackHtml)) {
+            const resolvedSlug = extractNuSlugFromHtml(fallbackHtml);
+            return {
+              html: fallbackHtml,
+              source: 'nameSlugFallback',
+              seriesId: '',
+              nuSlug: resolvedSlug || fallbackNameSlug,
+              seriesName: queryName
+            };
+          }
+        } catch (error) {
+          Logger.warn('resolve series by fallback name slug failed', {
+            queryName,
+            fallbackNameSlug,
+            error
+          });
+        }
+      }
     }
 
-    throw new Error(`unable to resolve NU series: ${queryName || nuSlug || novelTitle || 'unknown'}`);
+    throw new Error(`unable to resolve NU series: ${queryName || normalizedNuSlug || novelTitle || 'unknown'}`);
   };
 
   const dedupeNovelEntriesById = (entries) => {
@@ -839,20 +1370,20 @@
     form.set('mygrpfilter', ajaxMeta.groupFilter || '');
     form.set('mygrr', ajaxMeta.groupId || '0');
 
-    const response = await fetch('https://www.novelupdates.com/wp-admin/admin-ajax.php', {
+    const result = await fetchTextWithRetry('https://www.novelupdates.com/wp-admin/admin-ajax.php', {
       method: 'POST',
       credentials: 'include',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
       },
       body: form.toString()
+    }, {
+      label: 'nd_getchapters',
+      maxAttempts: 4,
+      retryBaseMs: 900
     });
 
-    if (!response.ok) {
-      throw new Error(`nd_getchapters failed: ${response.status}`);
-    }
-
-    const payload = await response.text();
+    const payload = result.text;
     return payload.endsWith('0') ? payload.slice(0, -1) : payload;
   };
 
@@ -906,7 +1437,7 @@
     let success = 0;
     for (const [slug, novel] of scopedEntries) {
       const config = configs[slug] || {};
-      const nuSlug = config.nuSlug || data.publishedReleases?.[slug]?.nuSlug || slug;
+      const nuSlug = normalizeNuSlugInput(config.nuSlug || data.publishedReleases?.[slug]?.nuSlug || slug);
       const unlockedKeys = new Set((novel.chapters || [])
         .filter((chapter) => chapter?.unlocked && chapter?.index)
         .map((chapter) => toReleaseKey(chapter.index).toLowerCase()));
@@ -929,6 +1460,8 @@
 
         success += 1;
         UI.toast(`同步 ${slug} 完成：已解锁 ${unlockedKeys.size} / 已发布 ${publishedUnlocked} / 待发布 ${pendingCount}`, 'info', 4600);
+
+        await clearSubmitLocksByPublishedKeys(slug, publishedSet);
 
         if (resolvedNuSlug && resolvedNuSlug !== config.nuSlug) {
           data.novelConfigs = data.novelConfigs || {};
@@ -959,6 +1492,7 @@
     const configs = data.novelConfigs || {};
     const published = data.publishedReleases || {};
     const scopedEntries = pickScopedNovelEntries(data);
+    const submitLocks = await readSubmitLocks();
 
     const pending = [];
 
@@ -972,6 +1506,11 @@
         }
         const releaseKey = toReleaseKey(chapter.index).toLowerCase();
         if (publishedSet.has(releaseKey)) {
+          return;
+        }
+
+        const lockToken = `${slug}:${releaseKey}`;
+        if (submitLocks[lockToken]) {
           return;
         }
 
@@ -1216,16 +1755,17 @@
     }
 
     const canQueueSubmit = Boolean(seriesHiddenValue) && (!hasGroupName || Boolean(groupHiddenValue));
+    await setPendingSubmit(item);
+
     if (canQueueSubmit) {
-      await setPendingSubmit(item);
       UI.toast(`已填充：${item.novelTitle} ${item.releaseText}，请点击 Submit；提交成功后自动移除`, 'info', 5200);
-      if (isAddReleasePage()) {
-        renderPendingPanel().catch((error) => Logger.error('refresh pending panel after fill failed', error));
-      }
-      return;
+    } else {
+      UI.toast('已填充并标记待提交，但 Series/Group 可能未命中，请手动检查后提交', 'warn', 5200);
     }
 
-    UI.toast('已填充基础字段，但未标记为待提交，请先完成 Series/Group 选择', 'warn', 5200);
+    if (isAddReleasePage()) {
+      renderPendingPanel().catch((error) => Logger.error('refresh pending panel after fill failed', error));
+    }
   };
 
   const renderPendingPanel = async () => {
@@ -1244,7 +1784,8 @@
       actions: [
         { label: '🔄 刷新状态', onClick: () => renderPendingPanel() },
         { label: '🧲 拉取私域', onClick: () => importDataFromFoxBridge().then(() => renderPendingPanel()) },
-        { label: '📡 同步已发布', primary: true, onClick: () => syncPublishedStatus() }
+        { label: '📡 同步已发布', primary: true, onClick: () => syncPublishedStatus() },
+        { label: '🧹 清空置灰', onClick: () => clearSubmitLocks().then(() => renderPendingPanel()) }
       ]
     });
     panel.dataset.synnovelPanel = 'pending';
@@ -1334,6 +1875,8 @@
     await importDataFromFoxBridge({ silent: true });
 
     if (isAddReleasePage()) {
+      installSubmitWatcher();
+      registerPendingSubmitOnForm().catch((error) => Logger.warn('register pending on init failed', error));
       await reconcilePendingSubmitAfterSuccess();
       renderPendingPanel().catch((error) => Logger.error('init add release panel failed', error));
     } else {

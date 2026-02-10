@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Foxaholic Helper
 // @namespace    https://github.com/shixq/syn-novel
-// @version      1.2.1
+// @version      1.2.3
 // @description  私域小说平台辅助：状态扫描、映射配置、章节导入填充
 // @match        https://18.foxaholic.com/wp-admin/*
 // @match        https://www.novelupdates.com/*
@@ -21,6 +21,7 @@
   let UI;
   let Parser;
   let Dom;
+  let bulkMappingEditorModalRef = null;
 
   const initFallbackShared = () => {
     const globalRoot = getGlobalRoot();
@@ -541,6 +542,35 @@
       .replace(/^-+|-+$/g, '')
       .trim();
 
+  const normalizeNuSlugInput = (value) => {
+    const raw = String(value || '').trim();
+    if (!raw) {
+      return '';
+    }
+
+    const fromPath = (pathname) => {
+      const cleaned = String(pathname || '').replace(/[?#].*$/, '').replace(/^\/+|\/+$/g, '');
+      const matched = cleaned.match(/^series\/(.+)$/i);
+      return matched ? String(matched[1] || '').replace(/^\/+|\/+$/g, '') : cleaned;
+    };
+
+    if (/^https?:\/\//i.test(raw)) {
+      try {
+        const url = new URL(raw);
+        const slugFromSeries = url.pathname.match(/\/series\/([^/]+)/i)?.[1] || '';
+        return slugFromSeries || fromPath(url.pathname);
+      } catch {
+        return fromPath(raw);
+      }
+    }
+
+    if (raw.startsWith('/')) {
+      return fromPath(raw);
+    }
+
+    return fromPath(raw);
+  };
+
   const getRowNovelMeta = (row) => {
     const rowId = row.id || '';
     const idMatch = rowId.match(/post-(\d+)/);
@@ -891,70 +921,420 @@
     UI.toast('已清空选择');
   };
 
-  const bulkConfigureSelectedNovels = async () => {
-    const idsFromTable = collectSelectedNovelIdsFromTable();
-    const selectedIds = idsFromTable.length ? idsFromTable : await ensureSelection();
+  const normalizeReleaseFormat = (value) => (String(value || '').trim().toLowerCase() === 'c' ? 'c' : 'chapter');
 
-    if (!selectedIds.length) {
-      UI.toast('请先勾选要配置的小说', 'warn');
-      return;
-    }
+  const resolveConfigContext = (data, {
+    postId,
+    title = '',
+    fallbackSlug = '',
+    extraAliases = []
+  } = {}) => {
+    const inferredSlug = slugify(title || fallbackSlug || `post-${postId}`);
+    const slugFromNovels = findNovelSlugById(data?.novels || {}, postId);
+    const slugFromConfigById = findConfigKeyByPostId(data?.novelConfigs || {}, postId);
 
-    const groupInput = prompt('批量 NU Group 名称（留空=不覆盖已有）', '');
-    if (groupInput === null) {
-      return;
-    }
+    const aliasKeys = normalizeConfigAliases([
+      slugFromNovels,
+      slugFromConfigById,
+      ...extraAliases,
+      fallbackSlug,
+      inferredSlug,
+      `post-${postId}`
+    ]);
 
-    const releaseInput = prompt('批量 Release 格式（chapter/c）', 'chapter');
-    if (releaseInput === null) {
-      return;
-    }
+    const primaryKey = aliasKeys[0] || inferredSlug || `post-${postId}`;
+    const merged = aliasKeys.reduce((acc, key) => {
+      const config = data?.novelConfigs?.[key];
+      if (!config || typeof config !== 'object') {
+        return acc;
+      }
+      return { ...acc, ...config };
+    }, data?.novelConfigs?.[primaryKey] || {});
 
-    const releaseFormat = releaseInput.trim() === 'c' ? 'c' : 'chapter';
-    const groupName = groupInput.trim();
+    return {
+      primaryKey,
+      aliasKeys,
+      merged
+    };
+  };
 
+  const collectListMetasForBulkEditor = async () => {
     const rows = [...document.querySelectorAll('#the-list tr[id^="post-"]')];
-    const rowMap = new Map(rows.map((row) => {
-      const meta = getRowNovelMeta(row);
-      return [meta.id, meta];
-    }));
+    const allMetas = rows.map((row) => getRowNovelMeta(row)).filter((meta) => Boolean(meta.id));
+    if (!allMetas.length) {
+      return [];
+    }
+
+    const selectedFromTable = collectSelectedNovelIdsFromTable();
+    const selectedIds = selectedFromTable.length ? selectedFromTable : await ensureSelection();
+    if (!selectedIds.length) {
+      return allMetas;
+    }
+
+    const idSet = new Set(selectedIds.map((id) => Number.parseInt(id, 10)).filter(Boolean));
+    const scoped = allMetas.filter((meta) => idSet.has(meta.id));
+    if (scoped.length) {
+      if (scoped.length < idSet.size) {
+        UI.toast('仅展示当前页可见的已选小说', 'warn', 3800);
+      }
+      return scoped;
+    }
+
+    UI.toast('当前页没有已选小说，已切换为展示全部', 'warn', 3800);
+    return allMetas;
+  };
+
+  const createBulkMappingEditorModal = ({ rows, onSave }) => {
+    const overlay = document.createElement('div');
+    overlay.style.position = 'fixed';
+    overlay.style.inset = '0';
+    overlay.style.background = 'rgba(15, 23, 42, 0.42)';
+    overlay.style.zIndex = '999998';
+    overlay.style.display = 'flex';
+    overlay.style.alignItems = 'center';
+    overlay.style.justifyContent = 'center';
+    overlay.style.padding = '18px';
+
+    const card = document.createElement('div');
+    card.style.width = 'min(1220px, 96vw)';
+    card.style.maxHeight = '88vh';
+    card.style.background = '#fff';
+    card.style.borderRadius = '12px';
+    card.style.boxShadow = '0 10px 35px rgba(0,0,0,0.25)';
+    card.style.display = 'flex';
+    card.style.flexDirection = 'column';
+
+    const header = document.createElement('div');
+    header.style.padding = '14px 16px 10px';
+    header.style.borderBottom = '1px solid #eceff1';
+
+    const title = document.createElement('div');
+    title.textContent = `批量映射编辑（${rows.length} 本）`;
+    title.style.fontSize = '15px';
+    title.style.fontWeight = '600';
+
+    const desc = document.createElement('div');
+    desc.textContent = '逐行修改后点击“保存全部”，仅保存当前弹窗中的行';
+    desc.style.marginTop = '4px';
+    desc.style.fontSize = '12px';
+    desc.style.color = '#546e7a';
+
+    header.appendChild(title);
+    header.appendChild(desc);
+    card.appendChild(header);
+
+    const body = document.createElement('div');
+    body.style.padding = '12px 14px';
+    body.style.overflow = 'auto';
+
+    const table = document.createElement('table');
+    table.style.width = '100%';
+    table.style.borderCollapse = 'collapse';
+    table.style.fontSize = '12px';
+
+    const thead = document.createElement('thead');
+    const headRow = document.createElement('tr');
+    ['小说', 'NU Slug/链接', 'NU 小说名', 'NU Group', 'Release'].forEach((text) => {
+      const th = document.createElement('th');
+      th.textContent = text;
+      th.style.textAlign = 'left';
+      th.style.padding = '8px';
+      th.style.background = '#f8fafc';
+      th.style.borderBottom = '1px solid #e2e8f0';
+      th.style.position = 'sticky';
+      th.style.top = '0';
+      th.style.zIndex = '1';
+      headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    const tbody = document.createElement('tbody');
+    rows.forEach((item) => {
+      const tr = document.createElement('tr');
+      tr.dataset.postId = String(item.postId);
+      tr.dataset.title = item.title;
+      tr.dataset.slug = item.slug;
+
+      const titleTd = document.createElement('td');
+      titleTd.style.padding = '8px';
+      titleTd.style.borderBottom = '1px solid #f1f5f9';
+      const titleMain = document.createElement('div');
+      titleMain.textContent = item.title;
+      titleMain.style.fontWeight = '600';
+      titleMain.style.maxWidth = '280px';
+      titleMain.style.wordBreak = 'break-word';
+      const titleMeta = document.createElement('div');
+      titleMeta.textContent = `ID:${item.postId} · key:${item.configKey}`;
+      titleMeta.style.color = '#78909c';
+      titleMeta.style.marginTop = '2px';
+      titleMeta.style.fontSize = '11px';
+      titleTd.appendChild(titleMain);
+      titleTd.appendChild(titleMeta);
+      tr.appendChild(titleTd);
+
+      const createInputCell = ({ value = '', field = '', placeholder = '', width = '240px' }) => {
+        const td = document.createElement('td');
+        td.style.padding = '8px';
+        td.style.borderBottom = '1px solid #f1f5f9';
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.value = value;
+        input.dataset.field = field;
+        input.placeholder = placeholder;
+        input.style.width = width;
+        input.style.maxWidth = '100%';
+        input.style.border = '1px solid #cfd8dc';
+        input.style.borderRadius = '6px';
+        input.style.padding = '6px 8px';
+        input.style.fontSize = '12px';
+        td.appendChild(input);
+        return td;
+      };
+
+      tr.appendChild(createInputCell({
+        field: 'nuSlug',
+        value: item.nuSlug,
+        placeholder: 'slug 或 https://www.novelupdates.com/series/.../',
+        width: '290px'
+      }));
+
+      tr.appendChild(createInputCell({
+        field: 'nuSeriesName',
+        value: item.nuSeriesName,
+        placeholder: 'NU 系列名',
+        width: '260px'
+      }));
+
+      tr.appendChild(createInputCell({
+        field: 'nuGroupName',
+        value: item.nuGroupName,
+        placeholder: 'NU 翻译组名称',
+        width: '220px'
+      }));
+
+      const releaseTd = document.createElement('td');
+      releaseTd.style.padding = '8px';
+      releaseTd.style.borderBottom = '1px solid #f1f5f9';
+      const releaseSelect = document.createElement('select');
+      releaseSelect.dataset.field = 'releaseFormat';
+      releaseSelect.style.border = '1px solid #cfd8dc';
+      releaseSelect.style.borderRadius = '6px';
+      releaseSelect.style.padding = '6px 8px';
+      releaseSelect.style.fontSize = '12px';
+      const optionChapter = document.createElement('option');
+      optionChapter.value = 'chapter';
+      optionChapter.textContent = 'chapter';
+      const optionC = document.createElement('option');
+      optionC.value = 'c';
+      optionC.textContent = 'c';
+      releaseSelect.appendChild(optionChapter);
+      releaseSelect.appendChild(optionC);
+      releaseSelect.value = normalizeReleaseFormat(item.releaseFormat);
+      releaseTd.appendChild(releaseSelect);
+      tr.appendChild(releaseTd);
+
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    body.appendChild(table);
+    card.appendChild(body);
+
+    const footer = document.createElement('div');
+    footer.style.display = 'flex';
+    footer.style.justifyContent = 'flex-end';
+    footer.style.gap = '8px';
+    footer.style.padding = '10px 14px 14px';
+    footer.style.borderTop = '1px solid #eceff1';
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.textContent = '取消';
+    cancelBtn.style.padding = '7px 12px';
+    cancelBtn.style.border = '1px solid #cfd8dc';
+    cancelBtn.style.background = '#fff';
+    cancelBtn.style.borderRadius = '6px';
+    cancelBtn.style.cursor = 'pointer';
+
+    const saveBtn = document.createElement('button');
+    saveBtn.type = 'button';
+    saveBtn.textContent = '保存全部';
+    saveBtn.style.padding = '7px 12px';
+    saveBtn.style.border = '1px solid #1565c0';
+    saveBtn.style.background = '#1976d2';
+    saveBtn.style.color = '#fff';
+    saveBtn.style.borderRadius = '6px';
+    saveBtn.style.cursor = 'pointer';
+
+    let closed = false;
+    const close = () => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      document.removeEventListener('keydown', onKeyDown);
+      overlay.remove();
+      bulkMappingEditorModalRef = null;
+    };
+
+    const focusFirstInput = () => {
+      const firstInput = tbody.querySelector('input[data-field="nuSlug"], input[data-field="nuSeriesName"]');
+      if (firstInput) {
+        firstInput.focus();
+      }
+    };
+
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        close();
+      }
+    };
+
+    cancelBtn.addEventListener('click', () => close());
+
+    saveBtn.addEventListener('click', async () => {
+      if (saveBtn.dataset.loading === '1') {
+        return;
+      }
+
+      saveBtn.dataset.loading = '1';
+      saveBtn.disabled = true;
+      saveBtn.textContent = '保存中...';
+
+      const payload = [...tbody.querySelectorAll('tr[data-post-id]')].map((tr) => {
+        const readInput = (field) => String(tr.querySelector(`[data-field="${field}"]`)?.value || '').trim();
+        return {
+          postId: Number.parseInt(tr.dataset.postId || '', 10),
+          title: String(tr.dataset.title || '').trim(),
+          slug: String(tr.dataset.slug || '').trim(),
+          nuSlug: readInput('nuSlug'),
+          nuSeriesName: readInput('nuSeriesName'),
+          nuGroupName: readInput('nuGroupName'),
+          releaseFormat: normalizeReleaseFormat(readInput('releaseFormat'))
+        };
+      }).filter((item) => Boolean(item.postId));
+
+      try {
+        await onSave(payload);
+        close();
+      } catch (error) {
+        Logger.error('save bulk mapping editor failed', error);
+        UI.toast('保存失败，请查看控制台日志', 'error', 4200);
+      } finally {
+        saveBtn.dataset.loading = '0';
+        saveBtn.disabled = false;
+        saveBtn.textContent = '保存全部';
+      }
+    });
+
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay) {
+        close();
+      }
+    });
+
+    footer.appendChild(cancelBtn);
+    footer.appendChild(saveBtn);
+    card.appendChild(footer);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+    document.addEventListener('keydown', onKeyDown);
+
+    setTimeout(() => focusFirstInput(), 0);
+
+    return {
+      close,
+      focus: focusFirstInput
+    };
+  };
+
+  const bulkConfigureSelectedNovels = async () => {
+    if (bulkMappingEditorModalRef?.focus) {
+      bulkMappingEditorModalRef.focus();
+      return;
+    }
+
+    const metas = await collectListMetasForBulkEditor();
+    if (!metas.length) {
+      UI.toast('当前列表没有可配置的小说', 'warn');
+      return;
+    }
 
     const data = await Storage.get();
     data.novels = data.novels || {};
     data.novelConfigs = data.novelConfigs || {};
 
-    let updated = 0;
-    selectedIds.forEach((novelId) => {
-      const meta = rowMap.get(novelId);
-      if (!meta) {
-        return;
-      }
+    const rows = metas.map((meta) => {
+      const context = resolveConfigContext(data, {
+        postId: meta.id,
+        title: meta.title,
+        fallbackSlug: meta.slug
+      });
+      const prev = context.merged || {};
 
-      const configKey = findNovelSlugById(data.novels, novelId)
-        || findConfigKeyByPostId(data.novelConfigs, novelId)
-        || meta.slug
-        || `post-${novelId}`;
-
-      const prev = data.novelConfigs[configKey] || {};
-      data.novelConfigs[configKey] = {
-        ...prev,
-        nuSeriesName: String(prev.nuSeriesName || meta.title || `post-${novelId}`).trim(),
-        nuGroupName: groupName || String(prev.nuGroupName || '').trim(),
-        releaseFormat,
-        postId: novelId
+      return {
+        postId: meta.id,
+        title: meta.title,
+        slug: meta.slug,
+        configKey: context.primaryKey,
+        nuSlug: String(prev.nuSlug || '').trim(),
+        nuSeriesName: String(prev.nuSeriesName || meta.title || `post-${meta.id}`).trim(),
+        nuGroupName: String(prev.nuGroupName || '').trim(),
+        releaseFormat: normalizeReleaseFormat(prev.releaseFormat)
       };
-      updated += 1;
     });
 
-    await Storage.set(data);
-    notifyFoxDataUpdated('bulk-config-updated');
+    const saveRows = async (payload) => {
+      const nextData = await Storage.get();
+      nextData.novels = nextData.novels || {};
+      nextData.novelConfigs = nextData.novelConfigs || {};
 
-    if (!groupName) {
-      UI.toast(`批量映射完成 ${updated} 本（未覆盖 Group）`, 'info', 4200);
-      return;
-    }
+      let updated = 0;
+      payload.forEach((item) => {
+        const postId = Number.parseInt(item.postId, 10);
+        if (!postId) {
+          return;
+        }
 
-    UI.toast(`批量映射完成 ${updated} 本，Group=${groupName}`, 'info', 4200);
+        const title = String(item.title || '').trim() || `post-${postId}`;
+        const fallbackSlug = String(item.slug || '').trim() || slugify(title);
+        const context = resolveConfigContext(nextData, {
+          postId,
+          title,
+          fallbackSlug
+        });
+        const prev = context.merged || nextData.novelConfigs[context.primaryKey] || {};
+
+        nextData.novelConfigs[context.primaryKey] = {
+          ...prev,
+          nuSeriesName: String(item.nuSeriesName || title).trim(),
+          nuSlug: normalizeNuSlugInput(item.nuSlug),
+          nuGroupName: String(item.nuGroupName || '').trim(),
+          releaseFormat: normalizeReleaseFormat(item.releaseFormat),
+          postId
+        };
+
+        context.aliasKeys.forEach((key) => {
+          if (key === context.primaryKey) {
+            return;
+          }
+          const config = nextData.novelConfigs[key];
+          if (!config || Number.parseInt(config.postId, 10) !== postId) {
+            return;
+          }
+          delete nextData.novelConfigs[key];
+        });
+
+        updated += 1;
+      });
+
+      await Storage.set(nextData);
+      notifyFoxDataUpdated('bulk-config-editor-saved');
+      UI.toast(`批量映射已保存 ${updated} 本`, 'info', 4200);
+    };
+
+    bulkMappingEditorModalRef = createBulkMappingEditorModal({ rows, onSave: saveRows });
   };
 
   const openConfigForCurrentNovel = async () => {
@@ -990,6 +1370,11 @@
       return;
     }
 
+    const nuSlugInput = prompt('NU Slug/链接（可留空）', prev.nuSlug || '');
+    if (nuSlugInput === null) {
+      return;
+    }
+
     const nuGroupName = prompt('NU 翻译组名称', prev.nuGroupName || '');
     if (nuGroupName === null) {
       return;
@@ -1003,6 +1388,7 @@
     data.novelConfigs[primaryKey] = {
       ...prev,
       nuSeriesName: nuSeriesName.trim(),
+      nuSlug: normalizeNuSlugInput(nuSlugInput),
       nuGroupName: nuGroupName.trim(),
       releaseFormat: releaseFormat.trim() === 'c' ? 'c' : 'chapter',
       postId
@@ -1328,7 +1714,7 @@
       title: 'SynNovel 扫描助手',
       actions: [
         { label: '🔄 扫描选中', primary: true, onClick: () => scanSelectedNovels() },
-        { label: '⚙️ 批量映射', onClick: () => bulkConfigureSelectedNovels() },
+        { label: '⚙️ 批量映射编辑', onClick: () => bulkConfigureSelectedNovels() },
         { label: '✅ 全选活跃', onClick: () => selectActiveRows() },
         { label: '🧹 清除选择', onClick: () => clearSelection() }
       ]
