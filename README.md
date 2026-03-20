@@ -60,7 +60,7 @@ uv run pytest
 
 主要能力：
 - 小说列表页批量扫描章节状态
-- 小说编辑页配置 NU 映射
+- 小说列表页批量配置 NU 映射
 - Text Chapter 页导入 `_split.txt` 并队列填充
 
 ### 3.2 NU 脚本 B（NovelUpdates）
@@ -68,8 +68,10 @@ uv run pytest
 脚本文件：`userscripts/novelupdates-helper.user.js`
 
 主要能力：
-- 同步系列已发布章节
-- Add Release 页面展示待发布差集
+- 仅在 Add Release 页面工作
+- 按 `nuSlug` + `show all chapters` 严格同步已发布章节
+- 任一小说同步失败时全局阻断待发布列表
+- Add Release 页面展示“已解锁且未发布”的待发布差集
 - 点击“填充”自动写入 Series/Release/Link/Group
 
 ## 4. 数据结构
@@ -104,6 +106,6 @@ uv add --dev pytest
 - 确认已登录 NovelUpdates
 
 ### 5.4 NU 提示“未发现私域小说数据”
-- 先在 Fox 列表页执行 `扫描选中`（或编辑页 `立即扫描`）
+- 先在 Fox 列表页执行 `扫描选中`
 - 返回 NU 页面点击 `🧲 拉取私域`
 - 拉取成功后再点 `📡 同步已发布`

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelUpdates Release Helper
 // @namespace    https://github.com/shixq/syn-novel
-// @version      1.3.8
+// @version      1.4.0
 // @description  同步已发布章节并在 Add Release 页面自动填表
 // @match        https://www.novelupdates.com/*
 // @grant        GM_getValue
@@ -14,14 +14,88 @@
 
   const getGlobalRoot = () => (typeof unsafeWindow !== 'undefined' ? unsafeWindow : window);
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const createNUSyncRules = () => {
+    const SyncRuleReason = Object.freeze({
+      NONE: 'NONE',
+      MISSING_NU_SLUG: 'MISSING_NU_SLUG'
+    });
+
+    const normalizeReleaseKey = (value) => {
+      const raw = String(value || '').trim().toLowerCase();
+      if (!raw) {
+        return '';
+      }
+
+      const chapterMatched = raw.match(/^c\s*(\d+(?:\.\d+)?)$/i)
+        || raw.match(/^chapter\s*(\d+(?:\.\d+)?)$/i)
+        || raw.match(/^(\d+(?:\.\d+)?)$/i);
+
+      if (!chapterMatched) {
+        return '';
+      }
+
+      return `c${Number.parseInt(chapterMatched[1], 10)}`;
+    };
+
+    const sortReleaseKeys = (keys) => Array.from(new Set(keys || []))
+      .map((key) => normalizeReleaseKey(key))
+      .filter(Boolean)
+      .sort((a, b) => {
+        const ai = Number.parseInt(String(a).replace(/^c/i, ''), 10);
+        const bi = Number.parseInt(String(b).replace(/^c/i, ''), 10);
+        return ai - bi;
+      });
+
+    const validateSyncInput = ({ nuSlug } = {}) => {
+      const normalizedNuSlug = String(nuSlug || '').trim();
+      if (!normalizedNuSlug) {
+        return {
+          ok: false,
+          reason: SyncRuleReason.MISSING_NU_SLUG,
+          normalizedNuSlug: ''
+        };
+      }
+
+      return {
+        ok: true,
+        reason: SyncRuleReason.NONE,
+        normalizedNuSlug
+      };
+    };
+
+    const shouldBlockRun = (items) => {
+      const source = Array.isArray(items) ? items : [];
+      return source.some((item) => item && item.ok === false);
+    };
+
+    const buildPendingReleaseKeys = ({ unlockedKeys, publishedKeys } = {}) => {
+      const unlocked = new Set(sortReleaseKeys(unlockedKeys || []));
+      const published = new Set(sortReleaseKeys(publishedKeys || []));
+      return sortReleaseKeys([...unlocked].filter((key) => !published.has(key)));
+    };
+
+    return {
+      SyncRuleReason,
+      normalizeReleaseKey,
+      sortReleaseKeys,
+      validateSyncInput,
+      shouldBlockRun,
+      buildPendingReleaseKeys
+    };
+  };
+  const loadNUSyncRules = () => {
+    const sharedRules = getGlobalRoot()?.SynNovelShared?.NUSyncRules;
+    return sharedRules && typeof sharedRules.validateSyncInput === 'function'
+      ? sharedRules
+      : createNUSyncRules();
+  };
 
   let Logger = console;
   let Storage;
   let UI;
   let Dom;
+  let SyncRules = loadNUSyncRules();
   let pendingPanelRef = null;
-  let commonPanelRef = null;
-  let submitReconcileTick = 0;
 
   const initFallbackShared = () => {
     const globalRoot = getGlobalRoot();
@@ -360,6 +434,10 @@
       };
     }
 
+    if (!shared.NUSyncRules) {
+      shared.NUSyncRules = createNUSyncRules();
+    }
+
     shared.__singleFileFallbackReady = true;
     return shared;
   };
@@ -371,6 +449,7 @@
     Storage = shared.Storage;
     UI = shared.UI;
     Dom = shared.Dom;
+    SyncRules = shared.NUSyncRules || SyncRules;
     return {
       ready: Boolean(Storage && UI && Dom),
       usedFallback: Boolean(shared.__singleFileFallbackReady)
@@ -393,360 +472,6 @@
   };
 
   const isAddReleasePage = () => location.pathname.startsWith('/add-release');
-
-  const PENDING_SUBMIT_PATH = 'meta.pendingSubmit';
-  const SUBMIT_LOCKS_PATH = 'meta.submitLocks';
-  const SUBMIT_LOCK_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
-
-  const toPendingSubmitToken = (payload) => {
-    if (!payload?.slug || !payload?.releaseKey) {
-      return '';
-    }
-    return `${payload.slug}:${String(payload.releaseKey).toLowerCase()}`;
-  };
-
-  const readPendingSubmit = async () => {
-    const pending = await Storage.getPath(PENDING_SUBMIT_PATH, null);
-    if (!pending || typeof pending !== 'object') {
-      return null;
-    }
-
-    const slug = String(pending.slug || '').trim();
-    const releaseKey = String(pending.releaseKey || '').trim().toLowerCase();
-    if (!slug || !releaseKey) {
-      return null;
-    }
-
-    return {
-      ...pending,
-      slug,
-      releaseKey
-    };
-  };
-
-  const setPendingSubmit = async (item) => {
-    const payload = {
-      slug: String(item?.slug || '').trim(),
-      releaseKey: String(item?.releaseKey || '').trim().toLowerCase(),
-      releaseText: String(item?.releaseText || '').trim(),
-      novelTitle: String(item?.novelTitle || '').trim(),
-      at: new Date().toISOString()
-    };
-
-    if (!payload.slug || !payload.releaseKey) {
-      return null;
-    }
-
-    await Storage.update(PENDING_SUBMIT_PATH, payload);
-    return payload;
-  };
-
-  const clearPendingSubmit = async () => {
-    await Storage.update(PENDING_SUBMIT_PATH, null);
-  };
-
-  const readSubmitLocks = async () => {
-    const raw = await Storage.getPath(SUBMIT_LOCKS_PATH, {});
-    const source = raw && typeof raw === 'object' ? raw : {};
-    const now = Date.now();
-    const cleaned = {};
-    let changed = false;
-
-    Object.entries(source).forEach(([token, value]) => {
-      const slug = String(value?.slug || '').trim();
-      const releaseKey = String(value?.releaseKey || '').trim().toLowerCase();
-      const normalizedToken = slug && releaseKey ? `${slug}:${releaseKey}` : '';
-      const atText = String(value?.at || '').trim();
-      const atTs = Date.parse(atText || '');
-
-      if (!normalizedToken) {
-        changed = true;
-        return;
-      }
-
-      if (atTs && now - atTs > SUBMIT_LOCK_MAX_AGE_MS) {
-        changed = true;
-        return;
-      }
-
-      cleaned[normalizedToken] = {
-        ...(value && typeof value === 'object' ? value : {}),
-        slug,
-        releaseKey,
-        at: atText || new Date().toISOString()
-      };
-
-      if (token !== normalizedToken) {
-        changed = true;
-      }
-    });
-
-    if (changed) {
-      await Storage.update(SUBMIT_LOCKS_PATH, cleaned);
-    }
-
-    return cleaned;
-  };
-
-  const setSubmitLock = async (payload, { reason = 'submit-attempt' } = {}) => {
-    const token = toPendingSubmitToken(payload);
-    if (!token) {
-      return '';
-    }
-
-    const locks = await readSubmitLocks();
-    locks[token] = {
-      slug: String(payload.slug || '').trim(),
-      releaseKey: String(payload.releaseKey || '').trim().toLowerCase(),
-      releaseText: String(payload.releaseText || '').trim(),
-      novelTitle: String(payload.novelTitle || '').trim(),
-      reason,
-      at: new Date().toISOString()
-    };
-    await Storage.update(SUBMIT_LOCKS_PATH, locks);
-    return token;
-  };
-
-  const removeSubmitLock = async (payload) => {
-    const token = toPendingSubmitToken(payload);
-    if (!token) {
-      return false;
-    }
-
-    const locks = await readSubmitLocks();
-    if (!locks[token]) {
-      return false;
-    }
-
-    delete locks[token];
-    await Storage.update(SUBMIT_LOCKS_PATH, locks);
-    return true;
-  };
-
-  const clearSubmitLocks = async () => {
-    await Storage.update(SUBMIT_LOCKS_PATH, {});
-  };
-
-  const clearSubmitLocksByPublishedKeys = async (slug, publishedSet) => {
-    const targetSlug = String(slug || '').trim();
-    if (!targetSlug || !(publishedSet instanceof Set) || !publishedSet.size) {
-      return 0;
-    }
-
-    const locks = await readSubmitLocks();
-    let removed = 0;
-
-    Object.entries(locks).forEach(([token, value]) => {
-      const lockSlug = String(value?.slug || '').trim();
-      const lockReleaseKey = String(value?.releaseKey || '').trim().toLowerCase();
-      if (lockSlug !== targetSlug || !lockReleaseKey) {
-        return;
-      }
-      if (publishedSet.has(lockReleaseKey)) {
-        delete locks[token];
-        removed += 1;
-      }
-    });
-
-    if (removed > 0) {
-      await Storage.update(SUBMIT_LOCKS_PATH, locks);
-    }
-
-    return removed;
-  };
-
-  const hasSubmitSuccessHint = () => {
-    const params = new URLSearchParams(location.search || '');
-    const successParamMatched = ['success', 'submitted', 'result', 'status']
-      .map((key) => String(params.get(key) || '').toLowerCase())
-      .some((value) => ['1', 'true', 'ok', 'done', 'success', 'submitted'].includes(value));
-
-    if (successParamMatched) {
-      return true;
-    }
-
-    const selectors = [
-      '.alert-success',
-      '.notice-success',
-      '.updated',
-      '.message.success',
-      '#message',
-      '.entry-content .alert',
-      '.entry-content .notice',
-      '.entry-content .updated'
-    ];
-
-    const textSegments = selectors
-      .flatMap((selector) => [...document.querySelectorAll(selector)])
-      .map((node) => String(node.textContent || '').replace(/\s+/g, ' ').trim())
-      .filter(Boolean);
-
-    const bodyText = String(document.body?.innerText || '').replace(/\s+/g, ' ').trim();
-    textSegments.push(bodyText.slice(0, 2000));
-
-    const successPattern = /(release.{0,60}(submitted|added|accepted|received)|thank\s*you.{0,60}(submission|release)|successfully.{0,60}(submitted|added)|your\s*release\s*has\s*been\s*(submitted|received|added)|submission\s*(received|accepted|successful))/i;
-    const errorPattern = /(required|invalid|error|failed|duplicate|already\s+exist)/i;
-
-    return textSegments.some((segment) => successPattern.test(segment) && !errorPattern.test(segment));
-  };
-
-  const hasSubmitErrorHint = () => {
-    const selectors = [
-      '.alert-danger',
-      '.notice-error',
-      '.error',
-      '.message.error',
-      '#message',
-      '.entry-content .alert',
-      '.entry-content .notice'
-    ];
-
-    const textSegments = selectors
-      .flatMap((selector) => [...document.querySelectorAll(selector)])
-      .map((node) => String(node.textContent || '').replace(/\s+/g, ' ').trim())
-      .filter(Boolean);
-
-    const bodyText = String(document.body?.innerText || '').replace(/\s+/g, ' ').trim();
-    textSegments.push(bodyText.slice(0, 2400));
-
-    const errorPattern = /(required|invalid|error|failed|duplicate|already\s+exist|please\s+select|must\s+be\s+selected|captcha|rate\s*limit|too\s*many\s*requests)/i;
-    return textSegments.some((segment) => errorPattern.test(segment));
-  };
-
-  const registerPendingSubmitOnForm = async () => {
-    if (!isAddReleasePage()) {
-      return;
-    }
-
-    const pending = await readPendingSubmit();
-    if (pending) {
-      return;
-    }
-
-    const link = String(readFirstValue(['#arlink', 'input[name="arlink"]', 'input[name="url"]', 'input[name="link"]', '#link']) || '').trim();
-    if (!link) {
-      return;
-    }
-
-    const pendingList = await buildPendingList();
-    const matched = pendingList.find((item) => String(item.link || '').trim() === link)
-      || pendingList.find((item) => {
-        const itemLink = String(item.link || '').trim();
-        if (!itemLink) {
-          return false;
-        }
-        return link.includes(itemLink) || itemLink.includes(link);
-      });
-
-    if (matched) {
-      await setPendingSubmit(matched);
-      Logger.info('pending submit auto-registered from current form', {
-        slug: matched.slug,
-        releaseKey: matched.releaseKey
-      });
-    }
-  };
-
-  const reconcileAfterSubmitAttempt = async ({ refreshPanel = true } = {}) => {
-    const tick = ++submitReconcileTick;
-    const delays = [900, 2200, 4200];
-    let removed = false;
-
-    await registerPendingSubmitOnForm();
-    const pendingAtSubmit = await readPendingSubmit();
-    if (pendingAtSubmit) {
-      await setSubmitLock(pendingAtSubmit, { reason: 'submit-attempt' });
-    }
-
-    for (const delay of delays) {
-      await sleep(delay);
-      if (tick !== submitReconcileTick) {
-        return;
-      }
-
-      removed = await reconcilePendingSubmitAfterSuccess();
-      if (removed) {
-        break;
-      }
-    }
-
-    if (!removed) {
-      const pendingSubmit = await readPendingSubmit();
-      if (pendingSubmit) {
-        if (hasSubmitErrorHint()) {
-          UI.toast('检测到提交错误提示，本条未置灰，请修正表单后重试', 'error', 6200);
-        } else {
-          await clearPendingSubmit();
-          UI.toast('未检测到提交成功，已置灰当前条目避免重复提交；后续可同步已发布确认', 'warn', 6200);
-        }
-      }
-    }
-
-    if (refreshPanel && isAddReleasePage()) {
-      renderPendingPanel().catch((error) => Logger.error('refresh pending panel after submit watch failed', error));
-    }
-  };
-
-  const installSubmitWatcher = () => {
-    if (!isAddReleasePage()) {
-      return;
-    }
-
-    const forms = [...document.querySelectorAll('form')];
-    const targetForm = forms.find((form) => {
-      const submitControls = [...form.querySelectorAll('button[type="submit"], input[type="submit"]')];
-      return submitControls.some((control) => /submit/i.test(String(control.value || control.textContent || '')));
-    }) || forms[0];
-
-    if (!targetForm || targetForm.dataset.synnovelSubmitWatcherBound === '1') {
-      return;
-    }
-
-    targetForm.dataset.synnovelSubmitWatcherBound = '1';
-    targetForm.addEventListener('submit', () => {
-      registerPendingSubmitOnForm().catch((error) => Logger.warn('register pending on submit failed', error));
-      reconcileAfterSubmitAttempt({ refreshPanel: true }).catch((error) => Logger.warn('submit reconcile watch failed', error));
-    });
-
-    const submitButtons = [...targetForm.querySelectorAll('button[type="submit"], input[type="submit"]')];
-    submitButtons.forEach((button) => {
-      if (button.dataset.synnovelSubmitWatcherBound === '1') {
-        return;
-      }
-      button.dataset.synnovelSubmitWatcherBound = '1';
-      button.addEventListener('click', () => {
-        registerPendingSubmitOnForm().catch((error) => Logger.warn('register pending on click failed', error));
-        reconcileAfterSubmitAttempt({ refreshPanel: true }).catch((error) => Logger.warn('submit reconcile watch failed', error));
-      });
-    });
-  };
-
-  const reconcilePendingSubmitAfterSuccess = async () => {
-    if (!isAddReleasePage()) {
-      return false;
-    }
-
-    const pendingSubmit = await readPendingSubmit();
-    if (!pendingSubmit) {
-      return false;
-    }
-
-    const pendingAt = Date.parse(pendingSubmit.at || '');
-    if (pendingAt && Date.now() - pendingAt > 12 * 60 * 60 * 1000) {
-      await clearPendingSubmit();
-      return false;
-    }
-
-    if (!hasSubmitSuccessHint()) {
-      return false;
-    }
-
-    await Storage.addPublishedRelease(pendingSubmit.slug, pendingSubmit.releaseKey);
-    await removeSubmitLock(pendingSubmit);
-    await clearPendingSubmit();
-    UI.toast(`提交成功，已移除：${pendingSubmit.novelTitle || pendingSubmit.slug} ${pendingSubmit.releaseText || pendingSubmit.releaseKey}`, 'info', 5200);
-    return true;
-  };
 
   const pickNovelsBySelectedIds = (novels, selectedIds) => {
     const source = novels && typeof novels === 'object' ? novels : {};
@@ -838,37 +563,26 @@
     .replace(/[^a-z0-9]+/g, ' ')
     .trim();
 
-  const normalizeSearchKeyword = (value) => String(value || '')
+  const safeDecodeURIComponent = (value) => {
+    try {
+      return decodeURIComponent(String(value || ''));
+    } catch {
+      return String(value || '');
+    }
+  };
+
+  const slugifyNuSegment = (value) => safeDecodeURIComponent(value)
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
     .replace(/[‘’]/g, "'")
     .replace(/[“”]/g, '"')
+    .replace(/&/g, ' and ')
+    .replace(/[\u2018\u2019'"`]/g, '')
     .replace(/[‐‑‒–—―]/g, '-')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  const buildSeriesSearchKeywords = (seriesName) => {
-    const original = String(seriesName || '').trim();
-    if (!original) {
-      return [];
-    }
-
-    const normalized = normalizeSearchKeyword(original);
-    const alnum = normalized
-      .replace(/[^a-zA-Z0-9\s]+/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-    const tokens = alnum.toLowerCase().split(' ').filter(Boolean);
-    const reduced = tokens.length > 6 ? tokens.slice(0, tokens.length - 1).join(' ') : '';
-    const reduced2 = tokens.length > 8 ? tokens.slice(0, tokens.length - 2).join(' ') : '';
-
-    return Array.from(new Set([
-      original,
-      normalized,
-      alnum,
-      reduced,
-      reduced2
-    ].map((item) => String(item || '').trim()).filter(Boolean)));
-  };
+    .replace(/[^a-zA-Z0-9]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .toLowerCase();
 
   const normalizeNuSlugInput = (value) => {
     const raw = String(value || '').trim();
@@ -876,10 +590,24 @@
       return '';
     }
 
+    const normalizeSegment = (segment) => {
+      const decoded = safeDecodeURIComponent(String(segment || ''));
+      const cleaned = decoded.replace(/[?#].*$/, '').replace(/^\/+|\/+$/g, '');
+      const matched = cleaned.match(/^series\/(.+)$/i);
+      const extracted = matched ? String(matched[1] || '').replace(/^\/+|\/+$/g, '') : cleaned;
+      if (!extracted) {
+        return '';
+      }
+      if (/^[a-z0-9]+(?:-[a-z0-9]+)*$/i.test(extracted)) {
+        return extracted.toLowerCase();
+      }
+      return slugifyNuSegment(extracted);
+    };
+
     const fromPath = (pathname) => {
       const cleaned = String(pathname || '').replace(/[?#].*$/, '').replace(/^\/+|\/+$/g, '');
       const matched = cleaned.match(/^series\/(.+)$/i);
-      return matched ? String(matched[1] || '').replace(/^\/+|\/+$/g, '') : cleaned;
+      return normalizeSegment(matched ? String(matched[1] || '').replace(/^\/+|\/+$/g, '') : cleaned);
     };
 
     if (/^https?:\/\//i.test(raw)) {
@@ -888,7 +616,7 @@
         const slugFromSeries = url.pathname.match(/\/series\/([^/]+)/i)?.[1] || '';
         return slugFromSeries || fromPath(url.pathname);
       } catch {
-        return fromPath(raw);
+        return normalizeSegment(raw);
       }
     }
 
@@ -896,11 +624,28 @@
       return fromPath(raw);
     }
 
-    return fromPath(raw);
+    return normalizeSegment(raw);
   };
 
   const NU_REQUEST_GAP_MS = 560;
+  const NU_IFRAME_FETCH_TIMEOUT_MS = 18000;
   let nuLastRequestAt = 0;
+  let nuIframeRequestSeq = 0;
+
+  const getNuFetch = () => {
+    const globalRoot = getGlobalRoot();
+    if (globalRoot && typeof globalRoot.fetch === 'function') {
+      return globalRoot.fetch.bind(globalRoot);
+    }
+    if (typeof window.fetch === 'function') {
+      return window.fetch.bind(window);
+    }
+    throw new Error('fetch API unavailable');
+  };
+
+  const nuFetch = getNuFetch();
+
+  const isNuGetPageUrl = (url) => /^https:\/\/www\.novelupdates\.com\//i.test(String(url || '').trim());
 
   const sleepNuRequestGap = async () => {
     const elapsed = Date.now() - nuLastRequestAt;
@@ -929,20 +674,106 @@
     return fallbackMs;
   };
 
+  const fetchTextByIframeNavigation = async (url, { label = String(url || ''), timeoutMs = NU_IFRAME_FETCH_TIMEOUT_MS } = {}) => {
+    const targetUrl = String(url || '').trim();
+    if (!targetUrl) {
+      throw new Error(`${label} failed: empty url`);
+    }
+
+    await sleepNuRequestGap();
+    const seq = ++nuIframeRequestSeq;
+
+    return new Promise((resolve, reject) => {
+      const frame = document.createElement('iframe');
+      frame.style.position = 'fixed';
+      frame.style.width = '1px';
+      frame.style.height = '1px';
+      frame.style.opacity = '0';
+      frame.style.pointerEvents = 'none';
+      frame.style.border = '0';
+      frame.setAttribute('aria-hidden', 'true');
+      frame.dataset.synnovelIframeFetch = String(seq);
+
+      let settled = false;
+      const finalize = (fn, value) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        frame.removeEventListener('load', onLoad);
+        frame.removeEventListener('error', onError);
+        frame.remove();
+        fn(value);
+      };
+
+      const onError = () => finalize(reject, new Error(`${label} iframe navigation failed`));
+      const onLoad = () => {
+        try {
+          const doc = frame.contentDocument;
+          if (!doc) {
+            finalize(reject, new Error(`${label} iframe document missing`));
+            return;
+          }
+          const text = doc.documentElement?.outerHTML || doc.body?.outerHTML || '';
+          if (!String(text || '').trim()) {
+            finalize(reject, new Error(`${label} iframe empty html`));
+            return;
+          }
+          finalize(resolve, {
+            status: 200,
+            text,
+            headers: new Headers()
+          });
+        } catch (error) {
+          finalize(reject, error);
+        }
+      };
+
+      const timer = setTimeout(() => {
+        finalize(reject, new Error(`${label} iframe timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      frame.addEventListener('load', onLoad, { once: true });
+      frame.addEventListener('error', onError, { once: true });
+      document.body.appendChild(frame);
+      frame.src = targetUrl;
+    });
+  };
+
   const fetchTextWithRetry = async (url, init = {}, options = {}) => {
     const {
       label = String(url || ''),
       maxAttempts = 4,
       retryBaseMs = 1000,
-      retryStatuses = [429, 502, 503, 504]
+      retryStatuses = [403, 429, 502, 503, 504],
+      allowIframeFallback = true,
+      iframeTimeoutMs = NU_IFRAME_FETCH_TIMEOUT_MS
     } = options;
 
+    const method = String(init?.method || 'GET').toUpperCase();
+    const headerBag = new Headers(init?.headers || {});
+    if (!headerBag.has('Accept')) {
+      headerBag.set('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8');
+    }
+    if (method === 'POST' && !headerBag.has('X-Requested-With')) {
+      headerBag.set('X-Requested-With', 'XMLHttpRequest');
+    }
+
+    const requestInit = {
+      ...init,
+      method,
+      credentials: init?.credentials || 'include',
+      headers: Object.fromEntries(headerBag.entries())
+    };
+
     let lastError = null;
+    let lastStatus = 0;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       await sleepNuRequestGap();
 
       try {
-        const response = await fetch(url, init);
+        const response = await nuFetch(url, requestInit);
 
         if (response.ok) {
           return {
@@ -954,9 +785,13 @@
 
         if (retryStatuses.includes(response.status) && attempt < maxAttempts) {
           const fallbackDelay = retryBaseMs * attempt;
-          const retryDelay = response.status === 429
-            ? parseRetryAfterMs(response, fallbackDelay)
-            : fallbackDelay;
+          let retryDelay = fallbackDelay;
+          if (response.status === 429) {
+            retryDelay = parseRetryAfterMs(response, fallbackDelay);
+          } else if (response.status === 403) {
+            retryDelay = Math.max(fallbackDelay * 2, 1800 + attempt * 900);
+          }
+          retryDelay += Math.floor(Math.random() * 280);
 
           Logger.warn('NU request retrying due to status', {
             label,
@@ -968,6 +803,7 @@
           continue;
         }
 
+        lastStatus = response.status;
         lastError = new Error(`${label} failed: ${response.status}`);
       } catch (error) {
         lastError = error;
@@ -983,6 +819,11 @@
           continue;
         }
       }
+    }
+
+    if (method === 'GET' && allowIframeFallback && (lastStatus === 403 || lastStatus === 429) && isNuGetPageUrl(url)) {
+      Logger.warn('NU request switching to iframe fallback', { label, url, status: lastStatus });
+      return fetchTextByIframeNavigation(url, { label: `${label}:iframe`, timeoutMs: iframeTimeoutMs });
     }
 
     throw lastError || new Error(`${label} failed`);
@@ -1048,147 +889,6 @@
     return sortReleaseKeys(releases);
   };
 
-  const tokenizeTitleKey = (value) => String(value || '').split(/\s+/).filter(Boolean);
-
-  const scoreTitleMatch = (queryKey, candidateKey) => {
-    if (!queryKey || !candidateKey) {
-      return 0;
-    }
-
-    if (queryKey === candidateKey) {
-      return 3;
-    }
-
-    if (candidateKey.includes(queryKey) || queryKey.includes(candidateKey)) {
-      const maxLen = Math.max(queryKey.length, candidateKey.length) || 1;
-      const lenDiff = Math.abs(queryKey.length - candidateKey.length);
-      return 2 - (lenDiff / maxLen) * 0.4;
-    }
-
-    const queryTokens = tokenizeTitleKey(queryKey);
-    const candidateTokens = tokenizeTitleKey(candidateKey);
-    if (!queryTokens.length || !candidateTokens.length) {
-      return 0;
-    }
-
-    const querySet = new Set(queryTokens);
-    const candidateSet = new Set(candidateTokens);
-    let common = 0;
-    querySet.forEach((token) => {
-      if (candidateSet.has(token)) {
-        common += 1;
-      }
-    });
-
-    const overlap = common / Math.max(querySet.size, candidateSet.size);
-    const startsBonus = (candidateKey.startsWith(queryTokens[0]) || queryKey.startsWith(candidateTokens[0])) ? 0.12 : 0;
-    return overlap + startsBonus;
-  };
-
-  const parseSeriesSearchCandidates = (html, queryText) => {
-    const doc = new DOMParser().parseFromString(html, 'text/html');
-    const queryKey = normalizeTitleKey(queryText);
-
-    const nodes = [...new Set([
-      ...doc.querySelectorAll('.change_list'),
-      ...doc.querySelectorAll('[onclick*="changeitem("]')
-    ])];
-
-    const candidates = nodes.map((node) => {
-      const text = (node.textContent || '').trim();
-      const onclick = node.getAttribute('onclick') || '';
-      const matched = onclick.match(/changeitem\((['"])(.*?)\1\s*,\s*(['"])(.*?)\3\s*,\s*(['"])title\5/i);
-      return {
-        text,
-        textKey: normalizeTitleKey(text),
-        seriesId: matched ? String(matched[4] || '').trim() : ''
-      };
-    }).filter((item) => item.seriesId);
-
-    if (!candidates.length) {
-      return null;
-    }
-
-    const exact = candidates.find((item) => item.textKey === queryKey);
-    if (exact) {
-      return exact;
-    }
-
-    const scored = candidates
-      .map((item) => ({
-        ...item,
-        score: scoreTitleMatch(queryKey, item.textKey)
-      }))
-      .sort((a, b) => b.score - a.score);
-
-    const best = scored[0];
-    if (!best || best.score < 0.45) {
-      return null;
-    }
-
-    return best;
-  };
-
-  const fetchSeriesSearchCandidates = async (keyword) => {
-    const query = String(keyword || '').trim();
-    if (!query) {
-      return null;
-    }
-
-    const form = new URLSearchParams();
-    form.set('action', 'nd_ajaxsearch');
-    form.set('str', query);
-    form.set('strID', '100');
-    form.set('strType', 'series');
-
-    const result = await fetchTextWithRetry('https://www.novelupdates.com/wp-admin/admin-ajax.php', {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
-      },
-      body: form.toString()
-    }, {
-      label: 'nd_ajaxsearch',
-      maxAttempts: 4,
-      retryBaseMs: 900
-    });
-
-    const payload = result.text;
-    const html = payload.endsWith('0') ? payload.slice(0, -1) : payload;
-    return parseSeriesSearchCandidates(html, query);
-  };
-
-  const resolveSeriesInfoByName = async (seriesName) => {
-    const keywords = buildSeriesSearchKeywords(seriesName);
-    for (const keyword of keywords) {
-      try {
-        const matched = await fetchSeriesSearchCandidates(keyword);
-        if (matched?.seriesId) {
-          return {
-            ...matched,
-            matchedBy: keyword
-          };
-        }
-      } catch (error) {
-        Logger.warn('resolve series keyword lookup failed', {
-          seriesName,
-          keyword,
-          error
-        });
-      }
-    }
-
-    if (keywords.length > 1) {
-      Logger.warn('resolve series by name no candidate', {
-        source: String(seriesName || '').trim(),
-        keywords
-      });
-    }
-
-    return null;
-  };
-
   const extractNuSlugFromHtml = (html) => {
     const doc = new DOMParser().parseFromString(html, 'text/html');
     const canonicalHref = doc.querySelector('link[rel="canonical"]')?.getAttribute('href') || '';
@@ -1225,86 +925,30 @@
     const queryName = String(nuSeriesName || novelTitle || '').trim();
     const normalizedNuSlug = normalizeNuSlugInput(nuSlug);
 
-    if (normalizedNuSlug) {
-      try {
-        const slugUrl = `https://www.novelupdates.com/series/${normalizedNuSlug}/`;
-        const slugHtml = await fetchTextWithRetry(slugUrl, { credentials: 'include' }, {
-          label: `series:${normalizedNuSlug}`,
-          maxAttempts: 4,
-          retryBaseMs: 900
-        }).then((result) => result.text);
-        if (!isNu404Page(slugHtml) && isLikelyNuSeriesPage(slugHtml)) {
-          const resolvedSlug = extractNuSlugFromHtml(slugHtml);
-          return {
-            html: slugHtml,
-            source: 'nuSlug',
-            seriesId: '',
-            nuSlug: resolvedSlug || normalizedNuSlug,
-            seriesName: queryName || normalizedNuSlug
-          };
-        }
-      } catch (error) {
-        Logger.warn('resolve series by nuSlug failed, fallback to name', normalizedNuSlug, error);
-      }
+    const validated = SyncRules.validateSyncInput({ nuSlug: normalizedNuSlug });
+    if (!validated.ok) {
+      throw new Error(`${validated.reason}: ${queryName || novelTitle || 'unknown'}`);
     }
 
-    if (queryName) {
-      try {
-        const matched = await resolveSeriesInfoByName(queryName);
-        if (matched?.seriesId) {
-          const detailUrl = `https://www.novelupdates.com/?p=${matched.seriesId}`;
-          const detailHtml = await fetchTextWithRetry(detailUrl, { credentials: 'include' }, {
-            label: `seriesDetail:${matched.seriesId}`,
-            maxAttempts: 4,
-            retryBaseMs: 900
-          }).then((result) => result.text);
-          if (!isNu404Page(detailHtml) && isLikelyNuSeriesPage(detailHtml)) {
-            const resolvedSlug = extractNuSlugFromHtml(detailHtml);
-            return {
-              html: detailHtml,
-              source: 'nd_ajaxsearch',
-              seriesId: matched.seriesId,
-              nuSlug: resolvedSlug || normalizedNuSlug || '',
-              seriesName: matched.text || queryName,
-              matchedBy: matched.matchedBy || queryName
-            };
-          }
-        }
-      } catch (error) {
-        Logger.warn('resolve series by name failed', queryName, error);
-      }
+    const slugUrl = `https://www.novelupdates.com/series/${validated.normalizedNuSlug}/`;
+    const slugHtml = await fetchTextWithRetry(slugUrl, { credentials: 'include' }, {
+      label: `series:${validated.normalizedNuSlug}`,
+      maxAttempts: 4,
+      retryBaseMs: 900
+    }).then((result) => result.text);
 
-      const fallbackNameSlug = normalizeNuSlugInput(queryName);
-      if (fallbackNameSlug && fallbackNameSlug !== normalizedNuSlug) {
-        try {
-          const fallbackUrl = `https://www.novelupdates.com/series/${fallbackNameSlug}/`;
-          const fallbackHtml = await fetchTextWithRetry(fallbackUrl, { credentials: 'include' }, {
-            label: `series:fallbackNameSlug:${fallbackNameSlug}`,
-            maxAttempts: 3,
-            retryBaseMs: 900
-          }).then((result) => result.text);
-
-          if (!isNu404Page(fallbackHtml) && isLikelyNuSeriesPage(fallbackHtml)) {
-            const resolvedSlug = extractNuSlugFromHtml(fallbackHtml);
-            return {
-              html: fallbackHtml,
-              source: 'nameSlugFallback',
-              seriesId: '',
-              nuSlug: resolvedSlug || fallbackNameSlug,
-              seriesName: queryName
-            };
-          }
-        } catch (error) {
-          Logger.warn('resolve series by fallback name slug failed', {
-            queryName,
-            fallbackNameSlug,
-            error
-          });
-        }
-      }
+    if (isNu404Page(slugHtml) || !isLikelyNuSeriesPage(slugHtml)) {
+      throw new Error(`INVALID_NU_SLUG: ${validated.normalizedNuSlug}`);
     }
 
-    throw new Error(`unable to resolve NU series: ${queryName || normalizedNuSlug || novelTitle || 'unknown'}`);
+    const resolvedSlug = extractNuSlugFromHtml(slugHtml);
+    return {
+      html: slugHtml,
+      source: 'nuSlug',
+      seriesId: '',
+      nuSlug: resolvedSlug || validated.normalizedNuSlug,
+      seriesName: queryName || resolvedSlug || validated.normalizedNuSlug
+    };
   };
 
   const dedupeNovelEntriesById = (entries) => {
@@ -1340,6 +984,113 @@
     const selectedSet = new Set(selectedIds.map((id) => String(id)));
     const scoped = entries.filter(([, novel]) => novel?.id && selectedSet.has(String(novel.id)));
     return dedupeNovelEntriesById(scoped);
+  };
+
+  const STRICT_PENDING_MODE = true;
+
+  const SyncStatus = Object.freeze({
+    SUCCESS: 'SUCCESS',
+    FAILED: 'FAILED'
+  });
+
+  const SyncConfidence = Object.freeze({
+    HIGH: 'HIGH',
+    LOW: 'LOW'
+  });
+
+  const SyncReason = Object.freeze({
+    NONE: 'NONE',
+    MISSING_NU_SLUG: 'MISSING_NU_SLUG',
+    SHOW_ALL_UNAVAILABLE: 'SHOW_ALL_UNAVAILABLE',
+    RUN_BLOCKED: 'RUN_BLOCKED',
+    AUTH_REQUIRED: 'AUTH_REQUIRED',
+    WAF_BLOCKED: 'WAF_BLOCKED',
+    MAPPING_INVALID: 'MAPPING_INVALID',
+    PARSER_DRIFT: 'PARSER_DRIFT',
+    TEMP_NETWORK: 'TEMP_NETWORK'
+  });
+
+  const ensureSyncDiagnosticsMap = (data) => {
+    data.meta = data.meta || {};
+    data.meta.syncDiagnostics = data.meta.syncDiagnostics && typeof data.meta.syncDiagnostics === 'object'
+      ? data.meta.syncDiagnostics
+      : {};
+    return data.meta.syncDiagnostics;
+  };
+
+  const isHighConfidenceSync = (diag) => {
+    if (!diag || typeof diag !== 'object') {
+      return false;
+    }
+    return diag.status === SyncStatus.SUCCESS && diag.confidence === SyncConfidence.HIGH;
+  };
+
+  const classifySyncReasonByError = (error, fallbackReason = SyncReason.TEMP_NETWORK) => {
+    const text = String(error?.message || error || '').toLowerCase();
+    if (!text) {
+      return fallbackReason;
+    }
+    if (/missing_nu_slug/.test(text)) {
+      return SyncReason.MISSING_NU_SLUG;
+    }
+    if (/show_all_unavailable/.test(text)) {
+      return SyncReason.SHOW_ALL_UNAVAILABLE;
+    }
+    if (/invalid_nu_slug|series not found|failed: 404/.test(text)) {
+      return SyncReason.MAPPING_INVALID;
+    }
+    if (/403|forbidden|cloudflare|access denied|captcha|blocked/.test(text)) {
+      return SyncReason.WAF_BLOCKED;
+    }
+    if (/401|unauthorized|login|sign in|logged in/.test(text)) {
+      return SyncReason.AUTH_REQUIRED;
+    }
+    if (/timeout|network|failed to fetch|429|502|503|504/.test(text)) {
+      return SyncReason.TEMP_NETWORK;
+    }
+    return fallbackReason;
+  };
+
+  const classifySyncReasonBySeriesHtml = (html) => {
+    const raw = String(html || '');
+    const text = raw.toLowerCase();
+    if (!text.trim()) {
+      return SyncReason.PARSER_DRIFT;
+    }
+    if (isNu404Page(raw)) {
+      return SyncReason.MAPPING_INVALID;
+    }
+    if (/403|forbidden|access denied|cloudflare|attention required/.test(text)) {
+      return SyncReason.WAF_BLOCKED;
+    }
+    if (/login|log in|sign in|register|lost password|wp-login/i.test(text) && !isLikelyNuSeriesPage(raw)) {
+      return SyncReason.AUTH_REQUIRED;
+    }
+    return SyncReason.NONE;
+  };
+
+  const reasonLabel = (reason) => {
+    switch (reason) {
+      case SyncReason.MISSING_NU_SLUG:
+        return '未配置 NU Slug';
+      case SyncReason.SHOW_ALL_UNAVAILABLE:
+        return '无法获取 Show All Chapters';
+      case SyncReason.RUN_BLOCKED:
+        return '本轮同步被阻断';
+      case SyncReason.AUTH_REQUIRED:
+        return '登录态失效';
+      case SyncReason.WAF_BLOCKED:
+        return '触发站点风控';
+      case SyncReason.MAPPING_INVALID:
+        return '系列映射无效';
+      case SyncReason.PARSER_DRIFT:
+        return '页面结构变化';
+      case SyncReason.TEMP_NETWORK:
+        return '临时网络异常';
+      case SyncReason.NONE:
+      default:
+        return '正常';
+    }
   };
 
   const extractSeriesAjaxMeta = (html) => {
@@ -1387,44 +1138,145 @@
     return payload.endsWith('0') ? payload.slice(0, -1) : payload;
   };
 
+  const hasShowAllChaptersHint = (html) => {
+    const doc = new DOMParser().parseFromString(String(html || ''), 'text/html');
+    if (doc.querySelector('a[onclick*="nd_getchapters"], button[onclick*="nd_getchapters"], #showchapterlist, .showchapterlist')) {
+      return true;
+    }
+    const text = String(doc.body?.textContent || '').toLowerCase();
+    return /show\s*all\s*chapters/.test(text);
+  };
+
   const scanNovelSeries = async ({ novelSlug, nuSlug, nuSeriesName, novelTitle }) => {
-    const target = await resolveScanTarget({ nuSlug, nuSeriesName, novelTitle });
-    const html = target.html;
-    const releasesFromPage = extractReleaseKeysFromHtml(html);
+    const startedAt = Date.now();
+    const scannedAt = new Date().toISOString();
+    const queryName = String(nuSeriesName || novelTitle || '').trim();
 
-    let releasesFromShowAll = [];
-    const ajaxMeta = extractSeriesAjaxMeta(html);
-    if (ajaxMeta.postId) {
-      try {
-        const listingHtml = await fetchAllChapterListingHtml(ajaxMeta);
-        releasesFromShowAll = extractReleaseKeysFromHtml(listingHtml);
-      } catch (error) {
-        Logger.warn('scan show-all chapters failed, fallback to page table', target.nuSlug || nuSlug, error);
+    try {
+      const target = await resolveScanTarget({ nuSlug, nuSeriesName, novelTitle });
+      const html = String(target.html || '');
+      const resolvedNuSlug = target.nuSlug || nuSlug || '';
+      const htmlReason = classifySyncReasonBySeriesHtml(html);
+
+      if (htmlReason !== SyncReason.NONE) {
+        return {
+          novelSlug,
+          seriesName: target.seriesName || queryName || resolvedNuSlug,
+          resolvedNuSlug,
+          source: target.source || 'unknown',
+          status: SyncStatus.FAILED,
+          confidence: SyncConfidence.LOW,
+          reasonCode: htmlReason,
+          releases: [],
+          scannedAt,
+          durationMs: Date.now() - startedAt,
+          message: `series page invalid: ${htmlReason}`
+        };
       }
+
+      const hasShowAll = hasShowAllChaptersHint(html);
+      if (!hasShowAll) {
+        return {
+          novelSlug,
+          seriesName: target.seriesName || queryName || resolvedNuSlug,
+          resolvedNuSlug,
+          source: target.source || 'unknown',
+          status: SyncStatus.FAILED,
+          confidence: SyncConfidence.LOW,
+          reasonCode: SyncReason.SHOW_ALL_UNAVAILABLE,
+          releases: [],
+          scannedAt,
+          durationMs: Date.now() - startedAt,
+          message: 'show_all_unavailable: hint missing'
+        };
+      }
+
+      const ajaxMeta = extractSeriesAjaxMeta(html);
+      if (!ajaxMeta.postId) {
+        return {
+          novelSlug,
+          seriesName: target.seriesName || queryName || resolvedNuSlug,
+          resolvedNuSlug,
+          source: target.source || 'unknown',
+          status: SyncStatus.FAILED,
+          confidence: SyncConfidence.LOW,
+          reasonCode: SyncReason.SHOW_ALL_UNAVAILABLE,
+          releases: [],
+          scannedAt,
+          durationMs: Date.now() - startedAt,
+          message: 'show_all_unavailable: missing ajax postId'
+        };
+      }
+
+      let listingHtml = '';
+      try {
+        listingHtml = await fetchAllChapterListingHtml(ajaxMeta);
+      } catch (error) {
+        Logger.warn('scan show-all chapters failed', resolvedNuSlug, error);
+        return {
+          novelSlug,
+          seriesName: target.seriesName || queryName || resolvedNuSlug,
+          resolvedNuSlug,
+          source: target.source || 'unknown',
+          status: SyncStatus.FAILED,
+          confidence: SyncConfidence.LOW,
+          reasonCode: classifySyncReasonByError(error, SyncReason.SHOW_ALL_UNAVAILABLE),
+          releases: [],
+          scannedAt,
+          durationMs: Date.now() - startedAt,
+          message: String(error?.message || error || 'show_all_unavailable: fetch failed')
+        };
+      }
+
+      const releases = SyncRules.sortReleaseKeys(extractReleaseKeysFromHtml(listingHtml));
+      if (!releases.length) {
+        return {
+          novelSlug,
+          seriesName: target.seriesName || queryName || resolvedNuSlug,
+          resolvedNuSlug,
+          source: target.source || 'unknown',
+          status: SyncStatus.FAILED,
+          confidence: SyncConfidence.LOW,
+          reasonCode: SyncReason.PARSER_DRIFT,
+          releases: [],
+          scannedAt,
+          durationMs: Date.now() - startedAt,
+          message: 'no release parsed from series page'
+        };
+      }
+
+      return {
+        novelSlug,
+        seriesName: target.seriesName || queryName || resolvedNuSlug,
+        resolvedNuSlug,
+        source: target.source || 'unknown',
+        status: SyncStatus.SUCCESS,
+        confidence: SyncConfidence.HIGH,
+        reasonCode: SyncReason.NONE,
+        releases,
+        scannedAt,
+        durationMs: Date.now() - startedAt,
+        message: 'show-all parsed'
+      };
+    } catch (error) {
+      return {
+        novelSlug,
+        seriesName: queryName || nuSlug || novelSlug,
+        resolvedNuSlug: normalizeNuSlugInput(nuSlug),
+        source: 'resolveScanTarget',
+        status: SyncStatus.FAILED,
+        confidence: SyncConfidence.LOW,
+        reasonCode: classifySyncReasonByError(error, SyncReason.TEMP_NETWORK),
+        releases: [],
+        scannedAt,
+        durationMs: Date.now() - startedAt,
+        message: String(error?.message || error || 'scan failed')
+      };
     }
-
-    const releases = sortReleaseKeys([...releasesFromPage, ...releasesFromShowAll]);
-
-    if (!releases.length && isNu404Page(html)) {
-      throw new Error(`NU series not found for novel: ${novelSlug}`);
-    }
-
-    await Storage.setPublishedRecord(novelSlug, {
-      nuSlug: target.nuSlug || nuSlug,
-      lastScanned: new Date().toISOString(),
-      releases
-    });
-
-    return {
-      releases,
-      resolvedNuSlug: target.nuSlug || nuSlug,
-      source: target.source
-    };
   };
 
   const syncPublishedStatus = async () => {
     const data = await ensureNovelDataLoaded();
-    const novels = data.novels || {};
     const configs = data.novelConfigs || {};
     const scopedEntries = pickScopedNovelEntries(data);
     const slugs = scopedEntries.map(([slug]) => slug);
@@ -1434,53 +1286,139 @@
       return;
     }
 
-    let success = 0;
+    const diagnostics = ensureSyncDiagnosticsMap(data);
+    const runId = new Date().toISOString();
+    const reasonStats = {};
+    const scanResults = [];
+
     for (const [slug, novel] of scopedEntries) {
       const config = configs[slug] || {};
-      const nuSlug = normalizeNuSlugInput(config.nuSlug || data.publishedReleases?.[slug]?.nuSlug || slug);
-      const unlockedKeys = new Set((novel.chapters || [])
+      const nuSlug = normalizeNuSlugInput(config.nuSlug || '');
+      const inputCheck = SyncRules.validateSyncInput({ nuSlug });
+      const unlockedKeys = SyncRules.sortReleaseKeys((novel.chapters || [])
         .filter((chapter) => chapter?.unlocked && chapter?.index)
-        .map((chapter) => toReleaseKey(chapter.index).toLowerCase()));
+        .map((chapter) => toReleaseKey(chapter.index)));
 
-      try {
-        const { releases, resolvedNuSlug } = await scanNovelSeries({
+      let report;
+      if (!inputCheck.ok) {
+        report = {
           novelSlug: slug,
-          nuSlug,
+          seriesName: config.nuSeriesName || novel.title || slug,
+          resolvedNuSlug: '',
+          source: 'config',
+          status: SyncStatus.FAILED,
+          confidence: SyncConfidence.LOW,
+          reasonCode: SyncReason.MISSING_NU_SLUG,
+          releases: [],
+          scannedAt: new Date().toISOString(),
+          durationMs: 0,
+          message: 'missing nuSlug in mapping config'
+        };
+      } else {
+        report = await scanNovelSeries({
+          novelSlug: slug,
+          nuSlug: inputCheck.normalizedNuSlug,
           nuSeriesName: config.nuSeriesName || novel.title,
           novelTitle: novel.title
         });
-        const publishedSet = new Set(releases.map((item) => String(item).toLowerCase()));
-        let publishedUnlocked = 0;
-        unlockedKeys.forEach((releaseKey) => {
-          if (publishedSet.has(releaseKey)) {
-            publishedUnlocked += 1;
-          }
-        });
-        const pendingCount = Math.max(unlockedKeys.size - publishedUnlocked, 0);
-
-        success += 1;
-        UI.toast(`同步 ${slug} 完成：已解锁 ${unlockedKeys.size} / 已发布 ${publishedUnlocked} / 待发布 ${pendingCount}`, 'info', 4600);
-
-        await clearSubmitLocksByPublishedKeys(slug, publishedSet);
-
-        if (resolvedNuSlug && resolvedNuSlug !== config.nuSlug) {
-          data.novelConfigs = data.novelConfigs || {};
-          data.novelConfigs[slug] = {
-            ...(data.novelConfigs[slug] || {}),
-            ...config,
-            nuSlug: resolvedNuSlug
-          };
-          await Storage.set(data);
-        }
-      } catch (error) {
-        Logger.error('sync series failed', slug, error);
-        UI.toast(`同步失败：${slug}`, 'error');
       }
+
+      const reasonCode = report.reasonCode || SyncReason.NONE;
+      if (reasonCode !== SyncReason.NONE) {
+        reasonStats[reasonCode] = (reasonStats[reasonCode] || 0) + 1;
+      }
+
+      diagnostics[slug] = {
+        runId,
+        status: report.status,
+        confidence: report.confidence,
+        reasonCode,
+        source: report.source,
+        resolvedNuSlug: report.resolvedNuSlug || '',
+        releaseCount: Array.isArray(report.releases) ? report.releases.length : 0,
+        scannedAt: report.scannedAt || new Date().toISOString(),
+        durationMs: report.durationMs || 0,
+        message: report.message || ''
+      };
+
+      if (report.status === SyncStatus.SUCCESS && report.confidence === SyncConfidence.HIGH) {
+        const pendingKeys = SyncRules.buildPendingReleaseKeys({
+          unlockedKeys,
+          publishedKeys: report.releases || []
+        });
+        UI.toast(`扫描 ${slug} 完成：已解锁 ${unlockedKeys.length} / 已发布 ${(report.releases || []).length} / 待发布 ${pendingKeys.length}`, 'info', 4600);
+      } else {
+        UI.toast(`扫描失败：${slug}（${reasonLabel(reasonCode)}）`, 'error', 5600);
+      }
+
+      scanResults.push({ slug, novel, config, unlockedKeys, report });
 
       await sleep(380);
     }
 
-    UI.toast(`已发布状态同步完成 ${success}/${slugs.length}`, 'info', 4500);
+    const blocked = SyncRules.shouldBlockRun(scanResults.map((item) => ({
+      slug: item.slug,
+      ok: item.report.status === SyncStatus.SUCCESS && item.report.confidence === SyncConfidence.HIGH,
+      reason: item.report.reasonCode
+    })));
+
+    let persisted = 0;
+    let success = 0;
+    let failed = 0;
+    if (!blocked) {
+      data.publishedReleases = data.publishedReleases || {};
+      scanResults.forEach((item) => {
+        const { slug, config, report } = item;
+        if (!(report.status === SyncStatus.SUCCESS && report.confidence === SyncConfidence.HIGH)) {
+          failed += 1;
+          return;
+        }
+
+        data.publishedReleases[slug] = {
+          ...(data.publishedReleases[slug] || {}),
+          nuSlug: report.resolvedNuSlug || normalizeNuSlugInput(config.nuSlug || ''),
+          lastScanned: report.scannedAt || new Date().toISOString(),
+          releases: SyncRules.sortReleaseKeys(report.releases || [])
+        };
+        if (report.resolvedNuSlug && report.resolvedNuSlug !== config.nuSlug) {
+          data.novelConfigs = data.novelConfigs || {};
+          data.novelConfigs[slug] = {
+            ...(data.novelConfigs[slug] || {}),
+            ...config,
+            nuSlug: report.resolvedNuSlug
+          };
+        }
+        persisted += 1;
+        success += 1;
+      });
+    } else {
+      failed = scanResults.length;
+    }
+
+    data.meta = data.meta || {};
+    data.meta.lastSyncRunId = runId;
+    data.meta.lastSyncMode = STRICT_PENDING_MODE ? 'strict' : 'legacy';
+    data.meta.lastSyncFinishedAt = new Date().toISOString();
+    data.meta.lastSyncBlocked = blocked;
+    data.meta.lastSyncBlockedAt = blocked ? new Date().toISOString() : null;
+    await Storage.set(data);
+
+    const reasonSummary = Object.entries(reasonStats)
+      .map(([code, count]) => `${code}:${count}`)
+      .join(', ');
+    Logger.info('sync published summary', {
+      runId,
+      blocked,
+      success,
+      failed,
+      persisted,
+      reasonStats
+    });
+
+    const summaryText = blocked
+      ? `同步阻断：${scanResults.length} 本中存在失败，已停止落盘并清空待发布候选`
+      : `同步完成：成功 ${success} / 失败 ${failed} / 已落盘 ${persisted}`;
+    UI.toast(reasonSummary ? `${summaryText}（${reasonSummary}）` : summaryText, blocked ? 'error' : 'info', 6400);
 
     if (isAddReleasePage()) {
       renderPendingPanel().catch((error) => Logger.error('refresh pending panel failed', error));
@@ -1491,26 +1429,39 @@
     const data = await ensureNovelDataLoaded();
     const configs = data.novelConfigs || {};
     const published = data.publishedReleases || {};
+    const diagnostics = ensureSyncDiagnosticsMap(data);
     const scopedEntries = pickScopedNovelEntries(data);
-    const submitLocks = await readSubmitLocks();
+    const globalBlocked = Boolean(data.meta?.lastSyncBlocked);
+
+    if (STRICT_PENDING_MODE && globalBlocked) {
+      return [];
+    }
 
     const pending = [];
 
     scopedEntries.forEach(([slug, novel]) => {
+      if (STRICT_PENDING_MODE) {
+        const diag = diagnostics[slug];
+        if (!isHighConfidenceSync(diag)) {
+          return;
+        }
+      }
+
       const config = configs[slug] || {};
-      const publishedSet = new Set((published[slug]?.releases || []).map((item) => item.toLowerCase()));
+      const unlockedKeys = (novel.chapters || [])
+        .filter((chapter) => chapter?.unlocked && chapter?.index)
+        .map((chapter) => toReleaseKey(chapter.index));
+      const pendingKeys = new Set(SyncRules.buildPendingReleaseKeys({
+        unlockedKeys,
+        publishedKeys: published[slug]?.releases || []
+      }));
 
       (novel.chapters || []).forEach((chapter) => {
         if (!chapter.unlocked) {
           return;
         }
-        const releaseKey = toReleaseKey(chapter.index).toLowerCase();
-        if (publishedSet.has(releaseKey)) {
-          return;
-        }
-
-        const lockToken = `${slug}:${releaseKey}`;
-        if (submitLocks[lockToken]) {
+        const releaseKey = SyncRules.normalizeReleaseKey(toReleaseKey(chapter.index));
+        if (!pendingKeys.has(releaseKey)) {
           return;
         }
 
@@ -1754,13 +1705,11 @@
       UI.toast('Group 可能未命中候选，请手动点选 Group 后再提交', 'warn', 5000);
     }
 
-    const canQueueSubmit = Boolean(seriesHiddenValue) && (!hasGroupName || Boolean(groupHiddenValue));
-    await setPendingSubmit(item);
-
-    if (canQueueSubmit) {
-      UI.toast(`已填充：${item.novelTitle} ${item.releaseText}，请点击 Submit；提交成功后自动移除`, 'info', 5200);
+    const canSubmit = Boolean(seriesHiddenValue) && (!hasGroupName || Boolean(groupHiddenValue));
+    if (canSubmit) {
+      UI.toast(`已填充：${item.novelTitle} ${item.releaseText}，请点击 Submit，提交后点“同步已发布”确认`, 'info', 5600);
     } else {
-      UI.toast('已填充并标记待提交，但 Series/Group 可能未命中，请手动检查后提交', 'warn', 5200);
+      UI.toast('已填充但 Series/Group 可能未命中，请手动检查后再提交', 'warn', 5600);
     }
 
     if (isAddReleasePage()) {
@@ -1770,8 +1719,6 @@
 
   const renderPendingPanel = async () => {
     const pending = await buildPendingList();
-    const pendingSubmit = await readPendingSubmit();
-    const pendingSubmitToken = toPendingSubmitToken(pendingSubmit);
 
     [...document.querySelectorAll('[data-synnovel-panel="pending"]')].forEach((panel) => panel.remove());
 
@@ -1784,8 +1731,7 @@
       actions: [
         { label: '🔄 刷新状态', onClick: () => renderPendingPanel() },
         { label: '🧲 拉取私域', onClick: () => importDataFromFoxBridge().then(() => renderPendingPanel()) },
-        { label: '📡 同步已发布', primary: true, onClick: () => syncPublishedStatus() },
-        { label: '🧹 清空置灰', onClick: () => clearSubmitLocks().then(() => renderPendingPanel()) }
+        { label: '📡 同步已发布', primary: true, onClick: () => syncPublishedStatus() }
       ]
     });
     panel.dataset.synnovelPanel = 'pending';
@@ -1798,7 +1744,9 @@
 
     if (!pending.length) {
       const empty = document.createElement('div');
-      empty.textContent = '暂无待发布章节';
+      empty.textContent = STRICT_PENDING_MODE
+        ? '暂无待发布章节（严格模式仅展示高可信同步结果，请先点击“同步已发布”）'
+        : '暂无待发布章节';
       empty.style.fontSize = '12px';
       listWrap.appendChild(empty);
     } else {
@@ -1810,21 +1758,13 @@
         row.style.gap = '8px';
         row.style.padding = '4px 0';
 
-        const itemToken = toPendingSubmitToken(item);
-        const isPendingSubmit = pendingSubmitToken && itemToken === pendingSubmitToken;
-
         const label = document.createElement('span');
-        label.textContent = `${item.novelTitle} - ${item.releaseText}${isPendingSubmit ? '（待提交）' : ''}`;
+        label.textContent = `${item.novelTitle} - ${item.releaseText}`;
         label.style.fontSize = '12px';
 
         const btn = document.createElement('button');
-        btn.textContent = isPendingSubmit ? '待提交' : '填充';
+        btn.textContent = '填充';
         btn.style.fontSize = '11px';
-        btn.disabled = Boolean(isPendingSubmit);
-        if (isPendingSubmit) {
-          btn.style.opacity = '0.65';
-          btn.style.cursor = 'not-allowed';
-        }
 
         btn.addEventListener('click', () => {
           fillReleaseForm(item).catch((error) => {
@@ -1842,24 +1782,6 @@
     panel.appendChild(listWrap);
   };
 
-  const initCommonPanel = () => {
-    [...document.querySelectorAll('[data-synnovel-panel="common"]')].forEach((panel) => panel.remove());
-
-    if (commonPanelRef?.isConnected) {
-      return;
-    }
-
-    const panel = UI.createFloatingPanel({
-      title: 'NovelUpdates 同步助手',
-      actions: [
-        { label: '🧲 拉取私域', onClick: () => importDataFromFoxBridge() },
-        { label: '📡 同步已发布', primary: true, onClick: () => syncPublishedStatus() }
-      ]
-    });
-    panel.dataset.synnovelPanel = 'common';
-    commonPanelRef = panel;
-  };
-
   const bootstrap = async () => {
     const { ready, usedFallback } = await ensureSharedModules();
     if (!ready) {
@@ -1875,12 +1797,7 @@
     await importDataFromFoxBridge({ silent: true });
 
     if (isAddReleasePage()) {
-      installSubmitWatcher();
-      registerPendingSubmitOnForm().catch((error) => Logger.warn('register pending on init failed', error));
-      await reconcilePendingSubmitAfterSuccess();
       renderPendingPanel().catch((error) => Logger.error('init add release panel failed', error));
-    } else {
-      initCommonPanel();
     }
   };
 

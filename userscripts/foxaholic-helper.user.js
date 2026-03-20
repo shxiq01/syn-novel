@@ -521,10 +521,6 @@
     return location.pathname.includes('/wp-admin/edit.php') && location.search.includes('post_type=wp-manga');
   };
 
-  const isNovelEditPage = () => {
-    return location.pathname.includes('/wp-admin/post.php') && location.search.includes('action=edit');
-  };
-
   const isTextChapterPage = () => {
     if (!location.pathname.includes('/wp-admin/')) {
       return false;
@@ -1337,74 +1333,6 @@
     bulkMappingEditorModalRef = createBulkMappingEditorModal({ rows, onSave: saveRows });
   };
 
-  const openConfigForCurrentNovel = async () => {
-    const postId = Number.parseInt(new URLSearchParams(location.search).get('post') || '', 10);
-    if (!postId) {
-      UI.toast('未识别到当前小说 ID', 'warn');
-      return;
-    }
-
-    const title = (document.querySelector('#title')?.value || '').trim() || `post-${postId}`;
-    const inferredSlug = slugify(title);
-
-    const data = await Storage.get();
-    data.novelConfigs = data.novelConfigs || {};
-
-    const slugFromNovels = findNovelSlugById(data.novels || {}, postId);
-    const slugFromConfigById = findConfigKeyByPostId(data.novelConfigs, postId);
-    const slugFromPermalink = extractSlugAndBaseUrl(document).slug;
-
-    const aliasKeys = normalizeConfigAliases([slugFromNovels, slugFromConfigById, slugFromPermalink, inferredSlug]);
-    const primaryKey = aliasKeys[0] || inferredSlug || `post-${postId}`;
-
-    const prev = aliasKeys.reduce((acc, key) => {
-      const config = data.novelConfigs[key];
-      if (!config || typeof config !== 'object') {
-        return acc;
-      }
-      return { ...acc, ...config };
-    }, data.novelConfigs[primaryKey] || {});
-
-    const nuSeriesName = prompt('NU 小说名称', prev.nuSeriesName || title);
-    if (nuSeriesName === null) {
-      return;
-    }
-
-    const nuSlugInput = prompt('NU Slug/链接（可留空）', prev.nuSlug || '');
-    if (nuSlugInput === null) {
-      return;
-    }
-
-    const nuGroupName = prompt('NU 翻译组名称', prev.nuGroupName || '');
-    if (nuGroupName === null) {
-      return;
-    }
-
-    const releaseFormat = prompt('Release 格式（chapter/c）', prev.releaseFormat || 'chapter');
-    if (releaseFormat === null) {
-      return;
-    }
-
-    data.novelConfigs[primaryKey] = {
-      ...prev,
-      nuSeriesName: nuSeriesName.trim(),
-      nuSlug: normalizeNuSlugInput(nuSlugInput),
-      nuGroupName: nuGroupName.trim(),
-      releaseFormat: releaseFormat.trim() === 'c' ? 'c' : 'chapter',
-      postId
-    };
-
-    aliasKeys.forEach((key) => {
-      if (key !== primaryKey) {
-        delete data.novelConfigs[key];
-      }
-    });
-
-    await Storage.set(data);
-    notifyFoxDataUpdated('config-updated');
-    UI.toast(`配置已保存：${primaryKey}`);
-  };
-
   const autoScanCurrentNovel = async () => {
     const postId = Number.parseInt(new URLSearchParams(location.search).get('post') || '', 10);
     if (!postId) {
@@ -1721,18 +1649,6 @@
     });
   };
 
-  const initEditPage = async () => {
-    UI.createFloatingPanel({
-      title: 'SynNovel 当前小说',
-      actions: [
-        { label: '⚙️ 配置映射', onClick: () => openConfigForCurrentNovel() },
-        { label: '🔄 立即扫描', primary: true, onClick: () => autoScanCurrentNovel() }
-      ]
-    });
-
-    await Dom.retry(() => autoScanCurrentNovel(), { attempts: 2, delay: 1000 }).catch(() => undefined);
-  };
-
   const initTextChapterPage = async () => {
     const slug = await guessCurrentNovelSlug();
     UI.createFloatingPanel({
@@ -1746,7 +1662,7 @@
   };
 
   const bootstrap = async () => {
-    const targetPage = isNovelListPage() || isNovelEditPage() || isTextChapterPage();
+    const targetPage = isNovelListPage() || isTextChapterPage();
 
     const { ready: sharedReady, usedFallback } = await ensureSharedModules();
     if (!sharedReady) {
@@ -1770,10 +1686,6 @@
 
     if (isNovelListPage()) {
       initListPage().catch((error) => Logger.error('init list page failed', error));
-    }
-
-    if (isNovelEditPage()) {
-      initEditPage().catch((error) => Logger.error('init edit page failed', error));
     }
 
     if (isTextChapterPage()) {
