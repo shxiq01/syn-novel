@@ -968,10 +968,10 @@
     const slugUrl = `https://www.novelupdates.com/series/${validated.normalizedNuSlug}/`;
     const slugHtml = await fetchTextWithRetry(slugUrl, { credentials: 'include' }, {
       label: `series:${validated.normalizedNuSlug}`,
-      maxAttempts: 2,
+      maxAttempts: 1,
       retryBaseMs: 900,
-      stopOnForbidden: true,
-      allowIframeFallback: false
+      stopOnForbidden: false,
+      allowIframeFallback: true
     }).then((result) => result.text);
 
     if (isNu404Page(slugHtml) || !isLikelyNuSeriesPage(slugHtml)) {
