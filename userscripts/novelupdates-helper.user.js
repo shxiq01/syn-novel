@@ -474,7 +474,7 @@
   const isAddReleasePage = () => location.pathname.startsWith('/add-release');
   const NU_WAF_COOLDOWN_PATH = 'meta.nuWafCooldownUntil';
   const NU_WAF_COOLDOWN_REASON_PATH = 'meta.nuWafCooldownReason';
-  const NU_WAF_COOLDOWN_MINUTES = 10;
+  const NU_WAF_COOLDOWN_MINUTES = 1;
 
   const pickNovelsBySelectedIds = (novels, selectedIds) => {
     const source = novels && typeof novels === 'object' ? novels : {};
@@ -631,8 +631,8 @@
   };
 
   const NU_REQUEST_GAP_MS = 560;
-  const NU_SYNC_SERIES_GAP_MIN_MS = 4200;
-  const NU_SYNC_SERIES_GAP_MAX_MS = 8200;
+  const NU_SYNC_SERIES_GAP_MIN_MS = 800;
+  const NU_SYNC_SERIES_GAP_MAX_MS = 1800;
   const NU_IFRAME_FETCH_TIMEOUT_MS = 18000;
   let nuLastRequestAt = 0;
   let nuIframeRequestSeq = 0;
@@ -1340,8 +1340,7 @@
 
     const cooldown = await readNuwafCooldownState();
     if (cooldown.active) {
-      UI.toast(`检测到风控冷却中，请 ${formatCooldownRemain(cooldown.untilTs)} 后重试`, 'warn', 6200);
-      return;
+      UI.toast(`检测到近期风控记录（剩余约 ${formatCooldownRemain(cooldown.untilTs)}），本次将继续尝试同步`, 'warn', 5200);
     }
 
     const diagnostics = ensureSyncDiagnosticsMap(data);
