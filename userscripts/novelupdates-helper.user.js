@@ -653,6 +653,7 @@
   const nuFetch = getNuFetch();
 
   const isNuGetPageUrl = (url) => /^https:\/\/www\.novelupdates\.com\//i.test(String(url || '').trim());
+  const isNuAdminAjaxUrl = (url) => /^https:\/\/www\.novelupdates\.com\/wp-admin\/admin-ajax\.php/i.test(String(url || '').trim());
 
   const sleepNuRequestGap = async () => {
     const elapsed = Date.now() - nuLastRequestAt;
@@ -766,6 +767,114 @@
     });
   };
 
+  const toFormEntriesFromBody = (body) => {
+    if (body instanceof URLSearchParams) {
+      return [...body.entries()];
+    }
+    if (typeof body === 'string') {
+      return [...new URLSearchParams(body).entries()];
+    }
+    return null;
+  };
+
+  const fetchTextByIframeFormPost = async (url, {
+    label = String(url || ''),
+    timeoutMs = NU_IFRAME_FETCH_TIMEOUT_MS,
+    body = ''
+  } = {}) => {
+    const targetUrl = String(url || '').trim();
+    if (!targetUrl) {
+      throw new Error(`${label} failed: empty url`);
+    }
+    const entries = toFormEntriesFromBody(body);
+    if (!entries) {
+      throw new Error(`${label} failed: iframe post fallback body unsupported`);
+    }
+
+    await sleepNuRequestGap();
+    const seq = ++nuIframeRequestSeq;
+
+    return new Promise((resolve, reject) => {
+      const frameName = `synnovel_iframe_post_${seq}`;
+      const frame = document.createElement('iframe');
+      frame.style.position = 'fixed';
+      frame.style.width = '1px';
+      frame.style.height = '1px';
+      frame.style.opacity = '0';
+      frame.style.pointerEvents = 'none';
+      frame.style.border = '0';
+      frame.setAttribute('aria-hidden', 'true');
+      frame.name = frameName;
+      frame.dataset.synnovelIframeFetch = String(seq);
+
+      const form = document.createElement('form');
+      form.method = 'POST';
+      form.action = targetUrl;
+      form.target = frameName;
+      form.style.display = 'none';
+
+      entries.forEach(([key, value]) => {
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = key;
+        input.value = value;
+        form.appendChild(input);
+      });
+
+      let settled = false;
+      let submitted = false;
+      const finalize = (fn, value) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        frame.removeEventListener('load', onLoad);
+        frame.removeEventListener('error', onError);
+        form.remove();
+        frame.remove();
+        fn(value);
+      };
+
+      const onError = () => finalize(reject, new Error(`${label} iframe post failed`));
+      const onLoad = () => {
+        if (!submitted) {
+          return;
+        }
+        try {
+          const doc = frame.contentDocument;
+          if (!doc) {
+            finalize(reject, new Error(`${label} iframe post document missing`));
+            return;
+          }
+          const text = doc.body?.innerHTML || doc.documentElement?.outerHTML || '';
+          if (!String(text || '').trim()) {
+            finalize(reject, new Error(`${label} iframe post empty html`));
+            return;
+          }
+          finalize(resolve, {
+            status: 200,
+            text,
+            headers: new Headers()
+          });
+        } catch (error) {
+          finalize(reject, error);
+        }
+      };
+
+      const timer = setTimeout(() => {
+        finalize(reject, new Error(`${label} iframe post timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      frame.addEventListener('load', onLoad);
+      frame.addEventListener('error', onError, { once: true });
+      document.body.appendChild(frame);
+      document.body.appendChild(form);
+      submitted = true;
+      form.submit();
+    });
+  };
+
   const fetchTextWithRetry = async (url, init = {}, options = {}) => {
     const {
       label = String(url || ''),
@@ -856,9 +965,18 @@
       }
     }
 
-    if (method === 'GET' && allowIframeFallback && (lastStatus === 429 || (!stopOnForbidden && lastStatus === 403)) && isNuGetPageUrl(url)) {
+    if (method === 'GET' && allowIframeFallback && (lastStatus === 429 || lastStatus === 403) && isNuGetPageUrl(url)) {
       Logger.warn('NU request switching to iframe fallback', { label, url, status: lastStatus });
       return fetchTextByIframeNavigation(url, { label: `${label}:iframe`, timeoutMs: iframeTimeoutMs });
+    }
+
+    if (method === 'POST' && allowIframeFallback && (lastStatus === 429 || lastStatus === 403) && isNuAdminAjaxUrl(url)) {
+      Logger.warn('NU POST request switching to iframe form fallback', { label, url, status: lastStatus });
+      return fetchTextByIframeFormPost(url, {
+        label: `${label}:iframePost`,
+        timeoutMs: iframeTimeoutMs,
+        body: requestInit.body
+      });
     }
 
     throw lastError || new Error(`${label} failed`);
@@ -1208,10 +1326,10 @@
       body: form.toString()
     }, {
       label: 'nd_getchapters',
-      maxAttempts: 2,
+      maxAttempts: 1,
       retryBaseMs: 900,
       stopOnForbidden: true,
-      allowIframeFallback: false
+      allowIframeFallback: true
     });
 
     const payload = result.text;
