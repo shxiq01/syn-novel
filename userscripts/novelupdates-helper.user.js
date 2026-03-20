@@ -631,8 +631,10 @@
   };
 
   const NU_REQUEST_GAP_MS = 560;
-  const NU_SYNC_SERIES_GAP_MIN_MS = 2500;
-  const NU_SYNC_SERIES_GAP_MAX_MS = 4500;
+  const NU_SYNC_SERIES_GAP_MIN_MS = 800;
+  const NU_SYNC_SERIES_GAP_MAX_MS = 1800;
+  const NU_SYNC_INTRA_GAP_MIN_MS = 400;
+  const NU_SYNC_INTRA_GAP_MAX_MS = 1200;
   const NU_IFRAME_FETCH_TIMEOUT_MS = 18000;
   let nuLastRequestAt = 0;
   let nuIframeRequestSeq = 0;
@@ -668,6 +670,12 @@
 
   const sleepNuSeriesGap = async () => {
     const delayMs = randomBetween(NU_SYNC_SERIES_GAP_MIN_MS, NU_SYNC_SERIES_GAP_MAX_MS);
+    await sleep(delayMs);
+    return delayMs;
+  };
+
+  const sleepNuIntraSeriesGap = async () => {
+    const delayMs = randomBetween(NU_SYNC_INTRA_GAP_MIN_MS, NU_SYNC_INTRA_GAP_MAX_MS);
     await sleep(delayMs);
     return delayMs;
   };
@@ -1263,6 +1271,7 @@
 
       let listingHtml = '';
       try {
+        await sleepNuIntraSeriesGap();
         listingHtml = await fetchAllChapterListingHtml(ajaxMeta);
       } catch (error) {
         Logger.warn('scan show-all chapters failed', resolvedNuSlug, error);
