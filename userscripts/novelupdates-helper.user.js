@@ -472,6 +472,9 @@
   };
 
   const isAddReleasePage = () => location.pathname.startsWith('/add-release');
+  const NU_WAF_COOLDOWN_PATH = 'meta.nuWafCooldownUntil';
+  const NU_WAF_COOLDOWN_REASON_PATH = 'meta.nuWafCooldownReason';
+  const NU_WAF_COOLDOWN_MINUTES = 10;
 
   const pickNovelsBySelectedIds = (novels, selectedIds) => {
     const source = novels && typeof novels === 'object' ? novels : {};
@@ -628,6 +631,8 @@
   };
 
   const NU_REQUEST_GAP_MS = 560;
+  const NU_SYNC_SERIES_GAP_MIN_MS = 4200;
+  const NU_SYNC_SERIES_GAP_MAX_MS = 8200;
   const NU_IFRAME_FETCH_TIMEOUT_MS = 18000;
   let nuLastRequestAt = 0;
   let nuIframeRequestSeq = 0;
@@ -653,6 +658,18 @@
       await sleep(NU_REQUEST_GAP_MS - elapsed);
     }
     nuLastRequestAt = Date.now();
+  };
+
+  const randomBetween = (min, max) => {
+    const floorMin = Math.max(0, Number.parseInt(min, 10) || 0);
+    const floorMax = Math.max(floorMin, Number.parseInt(max, 10) || floorMin);
+    return floorMin + Math.floor(Math.random() * (floorMax - floorMin + 1));
+  };
+
+  const sleepNuSeriesGap = async () => {
+    const delayMs = randomBetween(NU_SYNC_SERIES_GAP_MIN_MS, NU_SYNC_SERIES_GAP_MAX_MS);
+    await sleep(delayMs);
+    return delayMs;
   };
 
   const parseRetryAfterMs = (response, fallbackMs = 1200) => {
@@ -746,7 +763,8 @@
       label = String(url || ''),
       maxAttempts = 4,
       retryBaseMs = 1000,
-      retryStatuses = [403, 429, 502, 503, 504],
+      retryStatuses = [429, 502, 503, 504],
+      stopOnForbidden = true,
       allowIframeFallback = true,
       iframeTimeoutMs = NU_IFRAME_FETCH_TIMEOUT_MS
     } = options;
@@ -783,13 +801,22 @@
           };
         }
 
+        if (response.status === 403 && stopOnForbidden) {
+          lastStatus = response.status;
+          lastError = new Error(`${label} failed: ${response.status}`);
+          Logger.warn('NU request blocked by 403, stop retrying immediately', {
+            label,
+            status: response.status,
+            attempt
+          });
+          break;
+        }
+
         if (retryStatuses.includes(response.status) && attempt < maxAttempts) {
           const fallbackDelay = retryBaseMs * attempt;
           let retryDelay = fallbackDelay;
           if (response.status === 429) {
             retryDelay = parseRetryAfterMs(response, fallbackDelay);
-          } else if (response.status === 403) {
-            retryDelay = Math.max(fallbackDelay * 2, 1800 + attempt * 900);
           }
           retryDelay += Math.floor(Math.random() * 280);
 
@@ -821,7 +848,7 @@
       }
     }
 
-    if (method === 'GET' && allowIframeFallback && (lastStatus === 403 || lastStatus === 429) && isNuGetPageUrl(url)) {
+    if (method === 'GET' && allowIframeFallback && (lastStatus === 429 || (!stopOnForbidden && lastStatus === 403)) && isNuGetPageUrl(url)) {
       Logger.warn('NU request switching to iframe fallback', { label, url, status: lastStatus });
       return fetchTextByIframeNavigation(url, { label: `${label}:iframe`, timeoutMs: iframeTimeoutMs });
     }
@@ -933,8 +960,10 @@
     const slugUrl = `https://www.novelupdates.com/series/${validated.normalizedNuSlug}/`;
     const slugHtml = await fetchTextWithRetry(slugUrl, { credentials: 'include' }, {
       label: `series:${validated.normalizedNuSlug}`,
-      maxAttempts: 4,
-      retryBaseMs: 900
+      maxAttempts: 2,
+      retryBaseMs: 900,
+      stopOnForbidden: true,
+      allowIframeFallback: false
     }).then((result) => result.text);
 
     if (isNu404Page(slugHtml) || !isLikelyNuSeriesPage(slugHtml)) {
@@ -1016,6 +1045,46 @@
       ? data.meta.syncDiagnostics
       : {};
     return data.meta.syncDiagnostics;
+  };
+
+  const readNuwafCooldownState = async () => {
+    const untilText = String(await Storage.getPath(NU_WAF_COOLDOWN_PATH, '') || '').trim();
+    const reason = String(await Storage.getPath(NU_WAF_COOLDOWN_REASON_PATH, '') || '').trim();
+    const untilTs = Date.parse(untilText);
+    if (!untilText || Number.isNaN(untilTs)) {
+      return {
+        active: false,
+        untilText: '',
+        untilTs: 0,
+        reason
+      };
+    }
+
+    return {
+      active: untilTs > Date.now(),
+      untilText,
+      untilTs,
+      reason
+    };
+  };
+
+  const clearNuwafCooldown = async () => {
+    await Storage.update(NU_WAF_COOLDOWN_PATH, '');
+    await Storage.update(NU_WAF_COOLDOWN_REASON_PATH, '');
+  };
+
+  const activateNuwafCooldown = async ({ reason = SyncReason.WAF_BLOCKED, minutes = NU_WAF_COOLDOWN_MINUTES } = {}) => {
+    const spanMinutes = Math.max(1, Number.parseInt(minutes, 10) || NU_WAF_COOLDOWN_MINUTES);
+    const until = new Date(Date.now() + spanMinutes * 60 * 1000).toISOString();
+    await Storage.update(NU_WAF_COOLDOWN_PATH, until);
+    await Storage.update(NU_WAF_COOLDOWN_REASON_PATH, String(reason || SyncReason.WAF_BLOCKED));
+    return until;
+  };
+
+  const formatCooldownRemain = (untilTs) => {
+    const remainMs = Math.max(0, untilTs - Date.now());
+    const remainMin = Math.ceil(remainMs / 60000);
+    return `${remainMin} 分钟`;
   };
 
   const isHighConfidenceSync = (diag) => {
@@ -1130,8 +1199,10 @@
       body: form.toString()
     }, {
       label: 'nd_getchapters',
-      maxAttempts: 4,
-      retryBaseMs: 900
+      maxAttempts: 2,
+      retryBaseMs: 900,
+      stopOnForbidden: true,
+      allowIframeFallback: false
     });
 
     const payload = result.text;
@@ -1267,12 +1338,76 @@
       return;
     }
 
+    const cooldown = await readNuwafCooldownState();
+    if (cooldown.active) {
+      UI.toast(`检测到风控冷却中，请 ${formatCooldownRemain(cooldown.untilTs)} 后重试`, 'warn', 6200);
+      return;
+    }
+
     const diagnostics = ensureSyncDiagnosticsMap(data);
     const runId = new Date().toISOString();
     const reasonStats = {};
     const scanResults = [];
+    const scannedSlugs = new Set();
+    let abortedByWaf = false;
+    let cooldownUntilText = '';
+
+    const preflightEntry = scopedEntries.find(([slug]) => {
+      const config = configs[slug] || {};
+      const nuSlug = normalizeNuSlugInput(config.nuSlug || '');
+      return SyncRules.validateSyncInput({ nuSlug }).ok;
+    });
+    const preflightReportsBySlug = new Map();
+
+    if (preflightEntry) {
+      const [preSlug, preNovel] = preflightEntry;
+      const preConfig = configs[preSlug] || {};
+      const preNuSlug = normalizeNuSlugInput(preConfig.nuSlug || '');
+      const preReport = await scanNovelSeries({
+        novelSlug: preSlug,
+        nuSlug: preNuSlug,
+        nuSeriesName: preConfig.nuSeriesName || preNovel.title,
+        novelTitle: preNovel.title
+      });
+      preflightReportsBySlug.set(preSlug, preReport);
+
+      if (preReport.reasonCode === SyncReason.WAF_BLOCKED) {
+        abortedByWaf = true;
+        cooldownUntilText = await activateNuwafCooldown({ reason: SyncReason.WAF_BLOCKED });
+        reasonStats[SyncReason.WAF_BLOCKED] = (reasonStats[SyncReason.WAF_BLOCKED] || 0) + 1;
+        diagnostics[preSlug] = {
+          runId,
+          status: preReport.status,
+          confidence: preReport.confidence,
+          reasonCode: preReport.reasonCode,
+          source: preReport.source,
+          resolvedNuSlug: preReport.resolvedNuSlug || '',
+          releaseCount: Array.isArray(preReport.releases) ? preReport.releases.length : 0,
+          scannedAt: preReport.scannedAt || new Date().toISOString(),
+          durationMs: preReport.durationMs || 0,
+          message: preReport.message || 'preflight failed'
+        };
+        scanResults.push({
+          slug: preSlug,
+          novel: preNovel,
+          config: preConfig,
+          unlockedKeys: [],
+          report: preReport
+        });
+        scannedSlugs.add(preSlug);
+      } else {
+        await clearNuwafCooldown();
+      }
+    }
 
     for (const [slug, novel] of scopedEntries) {
+      if (abortedByWaf) {
+        break;
+      }
+      if (scannedSlugs.has(slug)) {
+        continue;
+      }
+
       const config = configs[slug] || {};
       const nuSlug = normalizeNuSlugInput(config.nuSlug || '');
       const inputCheck = SyncRules.validateSyncInput({ nuSlug });
@@ -1296,12 +1431,15 @@
           message: 'missing nuSlug in mapping config'
         };
       } else {
-        report = await scanNovelSeries({
-          novelSlug: slug,
-          nuSlug: inputCheck.normalizedNuSlug,
-          nuSeriesName: config.nuSeriesName || novel.title,
-          novelTitle: novel.title
-        });
+        report = preflightReportsBySlug.get(slug);
+        if (!report) {
+          report = await scanNovelSeries({
+            novelSlug: slug,
+            nuSlug: inputCheck.normalizedNuSlug,
+            nuSeriesName: config.nuSeriesName || novel.title,
+            novelTitle: novel.title
+          });
+        }
       }
 
       const reasonCode = report.reasonCode || SyncReason.NONE;
@@ -1333,8 +1471,59 @@
       }
 
       scanResults.push({ slug, novel, config, unlockedKeys, report });
+      scannedSlugs.add(slug);
 
-      await sleep(380);
+      if (reasonCode === SyncReason.WAF_BLOCKED) {
+        abortedByWaf = true;
+        cooldownUntilText = await activateNuwafCooldown({ reason: SyncReason.WAF_BLOCKED });
+        break;
+      }
+
+      if (scannedSlugs.size < scopedEntries.length) {
+        await sleepNuSeriesGap();
+      }
+    }
+
+    if (abortedByWaf) {
+      scopedEntries.forEach(([slug, novel]) => {
+        if (scannedSlugs.has(slug)) {
+          return;
+        }
+        const config = configs[slug] || {};
+        const runBlockedReport = {
+          novelSlug: slug,
+          seriesName: config.nuSeriesName || novel.title || slug,
+          resolvedNuSlug: normalizeNuSlugInput(config.nuSlug || ''),
+          source: 'sync',
+          status: SyncStatus.FAILED,
+          confidence: SyncConfidence.LOW,
+          reasonCode: SyncReason.RUN_BLOCKED,
+          releases: [],
+          scannedAt: new Date().toISOString(),
+          durationMs: 0,
+          message: 'scan skipped due to earlier waf block'
+        };
+        diagnostics[slug] = {
+          runId,
+          status: runBlockedReport.status,
+          confidence: runBlockedReport.confidence,
+          reasonCode: runBlockedReport.reasonCode,
+          source: runBlockedReport.source,
+          resolvedNuSlug: runBlockedReport.resolvedNuSlug || '',
+          releaseCount: 0,
+          scannedAt: runBlockedReport.scannedAt,
+          durationMs: 0,
+          message: runBlockedReport.message
+        };
+        reasonStats[SyncReason.RUN_BLOCKED] = (reasonStats[SyncReason.RUN_BLOCKED] || 0) + 1;
+        scanResults.push({
+          slug,
+          novel,
+          config,
+          unlockedKeys: [],
+          report: runBlockedReport
+        });
+      });
     }
 
     const blocked = SyncRules.shouldBlockRun(scanResults.map((item) => ({
@@ -1382,6 +1571,8 @@
     data.meta.lastSyncFinishedAt = new Date().toISOString();
     data.meta.lastSyncBlocked = blocked;
     data.meta.lastSyncBlockedAt = blocked ? new Date().toISOString() : null;
+    data.meta.lastSyncAbortByWaf = abortedByWaf;
+    data.meta.lastSyncCooldownUntil = cooldownUntilText || '';
     await Storage.set(data);
 
     const reasonSummary = Object.entries(reasonStats)
@@ -1390,6 +1581,7 @@
     Logger.info('sync published summary', {
       runId,
       blocked,
+      abortedByWaf,
       success,
       failed,
       persisted,
@@ -1399,7 +1591,13 @@
     const summaryText = blocked
       ? `同步阻断：${scanResults.length} 本中存在失败，已停止落盘并清空待发布候选`
       : `同步完成：成功 ${success} / 失败 ${failed} / 已落盘 ${persisted}`;
-    UI.toast(reasonSummary ? `${summaryText}（${reasonSummary}）` : summaryText, blocked ? 'error' : 'info', 6400);
+    const cooldownNote = abortedByWaf && cooldownUntilText
+      ? `，风控冷却至 ${new Date(cooldownUntilText).toLocaleTimeString()}`
+      : '';
+    if (abortedByWaf) {
+      UI.toast(`触发站点风控，已立即停止本轮${cooldownNote}`, 'error', 7200);
+    }
+    UI.toast(reasonSummary ? `${summaryText}${cooldownNote}（${reasonSummary}）` : `${summaryText}${cooldownNote}`, blocked ? 'error' : 'info', 6400);
 
     if (isAddReleasePage()) {
       renderPendingPanel().catch((error) => Logger.error('refresh pending panel failed', error));
