@@ -1129,7 +1129,8 @@
     if (isNu404Page(raw)) {
       return SyncReason.MAPPING_INVALID;
     }
-    if (/403|forbidden|access denied|cloudflare|attention required/.test(text)) {
+    const hasNuPostId = Boolean(new DOMParser().parseFromString(raw, 'text/html').querySelector('#mypostid'));
+    if (!hasNuPostId && /(403\s*forbidden|access denied|cloudflare|cf-ray|cf-chl|attention required)/i.test(text)) {
       return SyncReason.WAF_BLOCKED;
     }
     if (/login|log in|sign in|register|lost password|wp-login/i.test(text) && !isLikelyNuSeriesPage(raw)) {
