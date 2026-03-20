@@ -1138,13 +1138,11 @@
     return payload.endsWith('0') ? payload.slice(0, -1) : payload;
   };
 
-  const hasShowAllChaptersHint = (html) => {
-    const doc = new DOMParser().parseFromString(String(html || ''), 'text/html');
-    if (doc.querySelector('a[onclick*="nd_getchapters"], button[onclick*="nd_getchapters"], #showchapterlist, .showchapterlist')) {
-      return true;
-    }
-    const text = String(doc.body?.textContent || '').toLowerCase();
-    return /show\s*all\s*chapters/.test(text);
+  const hasExplicitNoReleaseHint = (html) => {
+    const text = String(new DOMParser().parseFromString(String(html || ''), 'text/html').body?.textContent || '')
+      .replace(/\s+/g, ' ')
+      .toLowerCase();
+    return /(no\s+(chapters?|releases?)\s*(found|yet|available)?|there\s+are\s+no\s+(chapters?|releases?))/i.test(text);
   };
 
   const scanNovelSeries = async ({ novelSlug, nuSlug, nuSeriesName, novelTitle }) => {
@@ -1171,23 +1169,6 @@
           scannedAt,
           durationMs: Date.now() - startedAt,
           message: `series page invalid: ${htmlReason}`
-        };
-      }
-
-      const hasShowAll = hasShowAllChaptersHint(html);
-      if (!hasShowAll) {
-        return {
-          novelSlug,
-          seriesName: target.seriesName || queryName || resolvedNuSlug,
-          resolvedNuSlug,
-          source: target.source || 'unknown',
-          status: SyncStatus.FAILED,
-          confidence: SyncConfidence.LOW,
-          reasonCode: SyncReason.SHOW_ALL_UNAVAILABLE,
-          releases: [],
-          scannedAt,
-          durationMs: Date.now() - startedAt,
-          message: 'show_all_unavailable: hint missing'
         };
       }
 
@@ -1229,7 +1210,7 @@
       }
 
       const releases = SyncRules.sortReleaseKeys(extractReleaseKeysFromHtml(listingHtml));
-      if (!releases.length) {
+      if (!releases.length && !hasExplicitNoReleaseHint(listingHtml)) {
         return {
           novelSlug,
           seriesName: target.seriesName || queryName || resolvedNuSlug,
@@ -1241,7 +1222,7 @@
           releases: [],
           scannedAt,
           durationMs: Date.now() - startedAt,
-          message: 'no release parsed from series page'
+          message: 'no release parsed from show-all payload'
         };
       }
 
