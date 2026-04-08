@@ -50,11 +50,6 @@
     };
   };
 
-  const shouldBlockRun = (items) => {
-    const source = Array.isArray(items) ? items : [];
-    return source.some((item) => item && item.ok === false);
-  };
-
   const buildPendingReleaseKeys = ({ unlockedKeys, publishedKeys } = {}) => {
     const unlocked = new Set(sortReleaseKeys(unlockedKeys || []));
     const published = new Set(sortReleaseKeys(publishedKeys || []));
@@ -67,7 +62,6 @@
     normalizeReleaseKey,
     sortReleaseKeys,
     validateSyncInput,
-    shouldBlockRun,
     buildPendingReleaseKeys
   };
 

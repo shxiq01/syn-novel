@@ -2,9 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
-from typing import Pattern
+from typing import Match, Pattern
 
 from .utils.text import split_by_paragraph, split_by_sentence
+
+
+GENERIC_NUMBERED_HEADING_PATTERN = re.compile(
+    r"^(?P<number>\d{1,4})(?P<sep>[.\s、:：\-])\s*(?P<body>.+)$",
+    re.IGNORECASE,
+)
+
+_GENERIC_NUMBERED_END_PUNCT_RE = re.compile(r"(?:[。.!?！？…]|\.{3,}|…+)[\"'”’）)\]}]*$")
+_GENERIC_NUMBERED_SENTENCE_MARK_RE = re.compile(r"[。!?！？…]")
 
 
 DEFAULT_CHAPTER_PATTERNS: tuple[Pattern[str], ...] = (
@@ -14,7 +23,7 @@ DEFAULT_CHAPTER_PATTERNS: tuple[Pattern[str], ...] = (
     re.compile(r"^chapter\s*\d+\b.*", re.IGNORECASE),
     re.compile(r"^part\s*\d+\b.*", re.IGNORECASE),
     re.compile(r"^(prologue|epilogue)\b.*", re.IGNORECASE),
-    re.compile(r"^\d+[.\s]+.+", re.IGNORECASE),
+    GENERIC_NUMBERED_HEADING_PATTERN,
 )
 
 
@@ -36,6 +45,42 @@ class ParseResult:
     leading_text: str = ""
 
 
+def _is_generic_numbered_heading(line: str, matched: Match[str]) -> bool:
+    body = matched.group("body").strip()
+    if not body:
+        return False
+
+    if len(line) > 90:
+        return False
+
+    if (body.count(",") + body.count("，")) >= 3:
+        return False
+
+    if _GENERIC_NUMBERED_END_PUNCT_RE.search(body):
+        return False
+
+    sep = matched.group("sep")
+    if sep.isspace():
+        if _GENERIC_NUMBERED_SENTENCE_MARK_RE.search(body):
+            return False
+        words = [token for token in body.split() if token]
+        if len(words) > 12:
+            return False
+
+    return True
+
+
+def _is_chapter_heading(line: str, patterns: tuple[Pattern[str], ...]) -> bool:
+    for pattern in patterns:
+        matched = pattern.match(line)
+        if not matched:
+            continue
+        if pattern is GENERIC_NUMBERED_HEADING_PATTERN:
+            return _is_generic_numbered_heading(line, matched)
+        return True
+    return False
+
+
 def _extract_chapters_and_leading_text(
     text: str,
     patterns: tuple[Pattern[str], ...],
@@ -47,7 +92,7 @@ def _extract_chapters_and_leading_text(
         line = raw_line.strip()
         if not line:
             continue
-        if any(pattern.match(line) for pattern in patterns):
+        if _is_chapter_heading(line, patterns):
             heading_indices.append(idx)
 
     if not heading_indices:

@@ -2,12 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import rules from '../../userscripts/shared/nu-sync-rules.js';
 
-test('block entire run when any item failed', () => {
-  const blocked = rules.shouldBlockRun([
-    { slug: 'a', ok: true },
-    { slug: 'b', ok: false, reason: 'SHOW_ALL_UNAVAILABLE' }
-  ]);
-  assert.equal(blocked, true);
+test('sync rules should not expose global block helper', () => {
+  assert.equal(Object.prototype.hasOwnProperty.call(rules, 'shouldBlockRun'), false);
 });
 
 test('pending only includes unlocked and unpublished', () => {

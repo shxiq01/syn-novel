@@ -46,3 +46,37 @@ def test_parse_fallback_sentence_when_no_heading():
     assert result.strategy == "fallback_sentence"
     assert len(result.chapters) >= 1
     assert result.leading_text == ""
+
+
+def test_parse_should_ignore_fullwidth_space_numeric_progress_lines():
+    text = (
+        "Chapter 1: The Start\n"
+        "opening text\n\n"
+        "1　document　processed...\n"
+        "2　documents　processed...\n\n"
+        "Chapter 2: The Next\n"
+        "ending text\n"
+    )
+    result = parse_chapters(text)
+    assert result.strategy == "regex"
+    assert len(result.chapters) == 2
+    assert result.chapters[0].original_title == "Chapter 1: The Start"
+    assert "1　document　processed" in result.chapters[0].content
+    assert result.chapters[1].original_title == "Chapter 2: The Next"
+
+
+def test_parse_should_not_treat_long_numeric_sentence_like_dialogue_as_heading():
+    text = (
+        "Chapter 12: Real Chapter\n"
+        "before scene\n"
+        "158 pink lace crop top, pink lace short shorts, petite and exquisite, this one's also wow, so hot!\"\n"
+        "after scene\n\n"
+        "Chapter 13: Next Chapter\n"
+        "next content\n"
+    )
+    result = parse_chapters(text)
+    assert result.strategy == "regex"
+    assert len(result.chapters) == 2
+    assert result.chapters[0].original_title == "Chapter 12: Real Chapter"
+    assert "158 pink lace crop top" in result.chapters[0].content
+    assert result.chapters[1].original_title == "Chapter 13: Next Chapter"

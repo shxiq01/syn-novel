@@ -63,11 +63,6 @@
       };
     };
 
-    const shouldBlockRun = (items) => {
-      const source = Array.isArray(items) ? items : [];
-      return source.some((item) => item && item.ok === false);
-    };
-
     const buildPendingReleaseKeys = ({ unlockedKeys, publishedKeys } = {}) => {
       const unlocked = new Set(sortReleaseKeys(unlockedKeys || []));
       const published = new Set(sortReleaseKeys(publishedKeys || []));
@@ -79,7 +74,6 @@
       normalizeReleaseKey,
       sortReleaseKeys,
       validateSyncInput,
-      shouldBlockRun,
       buildPendingReleaseKeys
     };
   };
@@ -475,6 +469,9 @@
   const NU_WAF_COOLDOWN_PATH = 'meta.nuWafCooldownUntil';
   const NU_WAF_COOLDOWN_REASON_PATH = 'meta.nuWafCooldownReason';
   const NU_WAF_COOLDOWN_MINUTES = 1;
+  const PENDING_SUBMIT_PATH = 'meta.pendingSubmit';
+  const SUBMIT_DISMISSED_PATH = 'meta.submitDismissed';
+  const PENDING_SUBMIT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
   const pickNovelsBySelectedIds = (novels, selectedIds) => {
     const source = novels && typeof novels === 'object' ? novels : {};
@@ -495,24 +492,42 @@
     return Object.keys(scoped).length ? scoped : source;
   };
 
-  const normalizeSyncPayload = (payload, current) => {
+  const normalizeSyncPayload = (payload, current, { clearSyncState = false } = {}) => {
     const payloadMeta = payload?.meta && typeof payload.meta === 'object' ? payload.meta : {};
     const payloadNovels = payload?.novels && typeof payload.novels === 'object' ? payload.novels : (current.novels || {});
     const scopedNovels = pickNovelsBySelectedIds(payloadNovels, payloadMeta.selectedNovelIds);
+    const nextMeta = {
+      ...(current.meta || {}),
+      ...payloadMeta,
+      lastMirroredFromFox: new Date().toISOString()
+    };
+
+    if (clearSyncState) {
+      nextMeta.syncDiagnostics = {};
+      nextMeta.lastSyncRunId = '';
+      nextMeta.lastSyncMode = '';
+      nextMeta.lastSyncFinishedAt = '';
+      nextMeta.lastSyncBlocked = false;
+      nextMeta.lastSyncBlockedAt = null;
+      nextMeta.lastSyncAbortByWaf = false;
+      nextMeta.lastSyncCooldownUntil = '';
+      nextMeta.nuWafCooldownUntil = '';
+      nextMeta.nuWafCooldownReason = '';
+      nextMeta.pendingSubmit = null;
+      nextMeta.submitDismissed = {};
+    }
 
     return {
       novels: scopedNovels,
       novelConfigs: payload?.novelConfigs && typeof payload.novelConfigs === 'object' ? payload.novelConfigs : (current.novelConfigs || {}),
-      publishedReleases: payload?.publishedReleases && typeof payload.publishedReleases === 'object' ? payload.publishedReleases : (current.publishedReleases || {}),
-      meta: {
-        ...(current.meta || {}),
-        ...payloadMeta,
-        lastMirroredFromFox: new Date().toISOString()
-      }
+      publishedReleases: clearSyncState
+        ? {}
+        : (payload?.publishedReleases && typeof payload.publishedReleases === 'object' ? payload.publishedReleases : (current.publishedReleases || {})),
+      meta: nextMeta
     };
   };
 
-  const importDataFromFoxBridge = async ({ silent = false } = {}) => {
+  const importDataFromFoxBridge = async ({ silent = false, clearSyncState = false } = {}) => {
     const globalRoot = getGlobalRoot();
     const bridge = globalRoot.SynNovelFoxBridge || window.SynNovelFoxBridge;
 
@@ -526,12 +541,16 @@
     try {
       const snapshot = await bridge.exportData();
       const current = await Storage.get();
-      const next = normalizeSyncPayload(snapshot, current);
+      const next = normalizeSyncPayload(snapshot, current, { clearSyncState });
       await Storage.set(next);
 
       const count = Object.keys(next.novels || {}).length;
       if (!silent && UI) {
-        UI.toast(`已拉取私域数据：${count} 本`, 'info', 3200);
+        if (clearSyncState) {
+          UI.toast(`已拉取私域数据：${count} 本；已清空上次同步状态，请重新同步`, 'info', 4200);
+        } else {
+          UI.toast(`已拉取私域数据：${count} 本`, 'info', 3200);
+        }
       }
       return count > 0;
     } catch (error) {
@@ -1455,280 +1474,228 @@
     }
   };
 
-  const syncPublishedStatus = async () => {
+  const getUnlockedReleaseKeys = (novel) => SyncRules.sortReleaseKeys((novel?.chapters || [])
+    .filter((chapter) => chapter?.unlocked && chapter?.index)
+    .map((chapter) => toReleaseKey(chapter.index)));
+
+  const syncSingleSeriesStatus = async (slug, { showToast = true, refreshPanel = false } = {}) => {
     const data = await ensureNovelDataLoaded();
     const configs = data.novelConfigs || {};
-    const scopedEntries = pickScopedNovelEntries(data);
-    const slugs = scopedEntries.map(([slug]) => slug);
-
-    if (!slugs.length) {
-      UI.toast('未发现私域小说数据，请先在 Fox 页面执行扫描后再同步', 'warn', 4200);
-      return;
-    }
-
-    const cooldown = await readNuwafCooldownState();
-    if (cooldown.active) {
-      UI.toast(`检测到近期风控记录（剩余约 ${formatCooldownRemain(cooldown.untilTs)}），本次将继续尝试同步`, 'warn', 5200);
-    }
-
     const diagnostics = ensureSyncDiagnosticsMap(data);
-    const runId = new Date().toISOString();
-    const reasonStats = {};
-    const scanResults = [];
-    const scannedSlugs = new Set();
-    let abortedByWaf = false;
-    let cooldownUntilText = '';
-
-    const preflightEntry = scopedEntries.find(([slug]) => {
-      const config = configs[slug] || {};
-      const nuSlug = normalizeNuSlugInput(config.nuSlug || '');
-      return SyncRules.validateSyncInput({ nuSlug }).ok;
-    });
-    const preflightReportsBySlug = new Map();
-
-    if (preflightEntry) {
-      const [preSlug, preNovel] = preflightEntry;
-      const preConfig = configs[preSlug] || {};
-      const preNuSlug = normalizeNuSlugInput(preConfig.nuSlug || '');
-      const preReport = await scanNovelSeries({
-        novelSlug: preSlug,
-        nuSlug: preNuSlug,
-        nuSeriesName: preConfig.nuSeriesName || preNovel.title,
-        novelTitle: preNovel.title
-      });
-      preflightReportsBySlug.set(preSlug, preReport);
-
-      if (preReport.reasonCode === SyncReason.WAF_BLOCKED) {
-        abortedByWaf = true;
-        cooldownUntilText = await activateNuwafCooldown({ reason: SyncReason.WAF_BLOCKED });
-        reasonStats[SyncReason.WAF_BLOCKED] = (reasonStats[SyncReason.WAF_BLOCKED] || 0) + 1;
-        diagnostics[preSlug] = {
-          runId,
-          status: preReport.status,
-          confidence: preReport.confidence,
-          reasonCode: preReport.reasonCode,
-          source: preReport.source,
-          resolvedNuSlug: preReport.resolvedNuSlug || '',
-          releaseCount: Array.isArray(preReport.releases) ? preReport.releases.length : 0,
-          scannedAt: preReport.scannedAt || new Date().toISOString(),
-          durationMs: preReport.durationMs || 0,
-          message: preReport.message || 'preflight failed'
-        };
-        scanResults.push({
-          slug: preSlug,
-          novel: preNovel,
-          config: preConfig,
-          unlockedKeys: [],
-          report: preReport
-        });
-        scannedSlugs.add(preSlug);
-      } else {
-        await clearNuwafCooldown();
+    const scopedEntries = pickScopedNovelEntries(data);
+    const matched = scopedEntries.find(([itemSlug]) => itemSlug === slug);
+    if (!matched) {
+      const error = new Error(`series not found in scoped novels: ${slug}`);
+      if (showToast) {
+        UI.toast(`同步失败：${slug}（未在私域列表中找到）`, 'error', 5200);
       }
+      return { ok: false, slug, error };
     }
 
-    for (const [slug, novel] of scopedEntries) {
-      if (abortedByWaf) {
-        break;
-      }
-      if (scannedSlugs.has(slug)) {
-        continue;
-      }
+    const [, novel] = matched;
+    const config = configs[slug] || {};
+    const runId = new Date().toISOString();
+    const unlockedKeys = getUnlockedReleaseKeys(novel);
+    const nuSlug = normalizeNuSlugInput(config.nuSlug || '');
+    const inputCheck = SyncRules.validateSyncInput({ nuSlug });
 
-      const config = configs[slug] || {};
-      const nuSlug = normalizeNuSlugInput(config.nuSlug || '');
-      const inputCheck = SyncRules.validateSyncInput({ nuSlug });
-      const unlockedKeys = SyncRules.sortReleaseKeys((novel.chapters || [])
-        .filter((chapter) => chapter?.unlocked && chapter?.index)
-        .map((chapter) => toReleaseKey(chapter.index)));
+    let report;
+    if (!inputCheck.ok) {
+      report = {
+        novelSlug: slug,
+        seriesName: config.nuSeriesName || novel.title || slug,
+        resolvedNuSlug: '',
+        source: 'config',
+        status: SyncStatus.FAILED,
+        confidence: SyncConfidence.LOW,
+        reasonCode: SyncReason.MISSING_NU_SLUG,
+        releases: [],
+        scannedAt: new Date().toISOString(),
+        durationMs: 0,
+        message: 'missing nuSlug in mapping config'
+      };
+    } else {
+      report = await scanNovelSeries({
+        novelSlug: slug,
+        nuSlug: inputCheck.normalizedNuSlug,
+        nuSeriesName: config.nuSeriesName || novel.title,
+        novelTitle: novel.title
+      });
+    }
 
-      let report;
-      if (!inputCheck.ok) {
-        report = {
-          novelSlug: slug,
-          seriesName: config.nuSeriesName || novel.title || slug,
-          resolvedNuSlug: '',
-          source: 'config',
-          status: SyncStatus.FAILED,
-          confidence: SyncConfidence.LOW,
-          reasonCode: SyncReason.MISSING_NU_SLUG,
-          releases: [],
-          scannedAt: new Date().toISOString(),
-          durationMs: 0,
-          message: 'missing nuSlug in mapping config'
-        };
-      } else {
-        report = preflightReportsBySlug.get(slug);
-        if (!report) {
-          report = await scanNovelSeries({
-            novelSlug: slug,
-            nuSlug: inputCheck.normalizedNuSlug,
-            nuSeriesName: config.nuSeriesName || novel.title,
-            novelTitle: novel.title
-          });
-        }
-      }
+    const reasonCode = report.reasonCode || SyncReason.NONE;
+    diagnostics[slug] = {
+      runId,
+      status: report.status,
+      confidence: report.confidence,
+      reasonCode,
+      source: report.source,
+      resolvedNuSlug: report.resolvedNuSlug || '',
+      releaseCount: Array.isArray(report.releases) ? report.releases.length : 0,
+      scannedAt: report.scannedAt || new Date().toISOString(),
+      durationMs: report.durationMs || 0,
+      message: report.message || ''
+    };
 
-      const reasonCode = report.reasonCode || SyncReason.NONE;
-      if (reasonCode !== SyncReason.NONE) {
-        reasonStats[reasonCode] = (reasonStats[reasonCode] || 0) + 1;
-      }
+    let pendingCount = unlockedKeys.length;
+    let publishedCount = 0;
+    const isSuccess = report.status === SyncStatus.SUCCESS && report.confidence === SyncConfidence.HIGH;
+    if (isSuccess) {
+      const publishedKeys = SyncRules.sortReleaseKeys(report.releases || []);
+      publishedCount = publishedKeys.length;
+      pendingCount = SyncRules.buildPendingReleaseKeys({
+        unlockedKeys,
+        publishedKeys
+      }).length;
 
-      diagnostics[slug] = {
-        runId,
-        status: report.status,
-        confidence: report.confidence,
-        reasonCode,
-        source: report.source,
-        resolvedNuSlug: report.resolvedNuSlug || '',
-        releaseCount: Array.isArray(report.releases) ? report.releases.length : 0,
-        scannedAt: report.scannedAt || new Date().toISOString(),
-        durationMs: report.durationMs || 0,
-        message: report.message || ''
+      data.publishedReleases = data.publishedReleases || {};
+      data.publishedReleases[slug] = {
+        ...(data.publishedReleases[slug] || {}),
+        nuSlug: report.resolvedNuSlug || inputCheck.normalizedNuSlug,
+        lastScanned: report.scannedAt || new Date().toISOString(),
+        releases: publishedKeys
       };
 
-      if (report.status === SyncStatus.SUCCESS && report.confidence === SyncConfidence.HIGH) {
-        const pendingKeys = SyncRules.buildPendingReleaseKeys({
-          unlockedKeys,
-          publishedKeys: report.releases || []
-        });
-        UI.toast(`扫描 ${slug} 完成：已解锁 ${unlockedKeys.length} / 已发布 ${(report.releases || []).length} / 待发布 ${pendingKeys.length}`, 'info', 4600);
-      } else {
-        UI.toast(`扫描失败：${slug}（${reasonLabel(reasonCode)}）`, 'error', 5600);
+      await clearSubmitDismissedByPublishedKeys(slug, publishedKeys);
+
+      const pendingSubmit = await readPendingSubmit();
+      if (pendingSubmit && pendingSubmit.slug === slug) {
+        const publishedSet = new Set(publishedKeys.map((item) => SyncRules.normalizeReleaseKey(item)));
+        if (publishedSet.has(SyncRules.normalizeReleaseKey(pendingSubmit.releaseKey))) {
+          await clearPendingSubmit();
+        }
       }
 
-      scanResults.push({ slug, novel, config, unlockedKeys, report });
-      scannedSlugs.add(slug);
-
-      if (reasonCode === SyncReason.WAF_BLOCKED) {
-        abortedByWaf = true;
-        cooldownUntilText = await activateNuwafCooldown({ reason: SyncReason.WAF_BLOCKED });
-        break;
+      if (report.resolvedNuSlug && report.resolvedNuSlug !== config.nuSlug) {
+        data.novelConfigs = data.novelConfigs || {};
+        data.novelConfigs[slug] = {
+          ...(data.novelConfigs[slug] || {}),
+          ...config,
+          nuSlug: report.resolvedNuSlug
+        };
       }
 
-      if (scannedSlugs.size < scopedEntries.length) {
-        await sleepNuSeriesGap();
-      }
-    }
-
-    if (abortedByWaf) {
-      scopedEntries.forEach(([slug, novel]) => {
-        if (scannedSlugs.has(slug)) {
-          return;
-        }
-        const config = configs[slug] || {};
-        const runBlockedReport = {
-          novelSlug: slug,
-          seriesName: config.nuSeriesName || novel.title || slug,
-          resolvedNuSlug: normalizeNuSlugInput(config.nuSlug || ''),
-          source: 'sync',
-          status: SyncStatus.FAILED,
-          confidence: SyncConfidence.LOW,
-          reasonCode: SyncReason.RUN_BLOCKED,
-          releases: [],
-          scannedAt: new Date().toISOString(),
-          durationMs: 0,
-          message: 'scan skipped due to earlier waf block'
-        };
-        diagnostics[slug] = {
-          runId,
-          status: runBlockedReport.status,
-          confidence: runBlockedReport.confidence,
-          reasonCode: runBlockedReport.reasonCode,
-          source: runBlockedReport.source,
-          resolvedNuSlug: runBlockedReport.resolvedNuSlug || '',
-          releaseCount: 0,
-          scannedAt: runBlockedReport.scannedAt,
-          durationMs: 0,
-          message: runBlockedReport.message
-        };
-        reasonStats[SyncReason.RUN_BLOCKED] = (reasonStats[SyncReason.RUN_BLOCKED] || 0) + 1;
-        scanResults.push({
-          slug,
-          novel,
-          config,
-          unlockedKeys: [],
-          report: runBlockedReport
-        });
-      });
-    }
-
-    const blocked = SyncRules.shouldBlockRun(scanResults.map((item) => ({
-      slug: item.slug,
-      ok: item.report.status === SyncStatus.SUCCESS && item.report.confidence === SyncConfidence.HIGH,
-      reason: item.report.reasonCode
-    })));
-
-    let persisted = 0;
-    let success = 0;
-    let failed = 0;
-    if (!blocked) {
-      data.publishedReleases = data.publishedReleases || {};
-      scanResults.forEach((item) => {
-        const { slug, config, report } = item;
-        if (!(report.status === SyncStatus.SUCCESS && report.confidence === SyncConfidence.HIGH)) {
-          failed += 1;
-          return;
-        }
-
-        data.publishedReleases[slug] = {
-          ...(data.publishedReleases[slug] || {}),
-          nuSlug: report.resolvedNuSlug || normalizeNuSlugInput(config.nuSlug || ''),
-          lastScanned: report.scannedAt || new Date().toISOString(),
-          releases: SyncRules.sortReleaseKeys(report.releases || [])
-        };
-        if (report.resolvedNuSlug && report.resolvedNuSlug !== config.nuSlug) {
-          data.novelConfigs = data.novelConfigs || {};
-          data.novelConfigs[slug] = {
-            ...(data.novelConfigs[slug] || {}),
-            ...config,
-            nuSlug: report.resolvedNuSlug
-          };
-        }
-        persisted += 1;
-        success += 1;
-      });
-    } else {
-      failed = scanResults.length;
+      await clearNuwafCooldown();
+    } else if (reasonCode === SyncReason.WAF_BLOCKED) {
+      const cooldownUntil = await activateNuwafCooldown({ reason: SyncReason.WAF_BLOCKED });
+      data.meta = data.meta || {};
+      data.meta.lastSyncCooldownUntil = cooldownUntil;
     }
 
     data.meta = data.meta || {};
     data.meta.lastSyncRunId = runId;
     data.meta.lastSyncMode = STRICT_PENDING_MODE ? 'strict' : 'legacy';
     data.meta.lastSyncFinishedAt = new Date().toISOString();
-    data.meta.lastSyncBlocked = blocked;
-    data.meta.lastSyncBlockedAt = blocked ? new Date().toISOString() : null;
-    data.meta.lastSyncAbortByWaf = abortedByWaf;
-    data.meta.lastSyncCooldownUntil = cooldownUntilText || '';
+    data.meta.lastSyncBlocked = false;
+    data.meta.lastSyncBlockedAt = null;
+    data.meta.lastSyncAbortByWaf = reasonCode === SyncReason.WAF_BLOCKED;
     await Storage.set(data);
+
+    if (showToast) {
+      if (isSuccess) {
+        UI.toast(`扫描 ${slug} 完成：已解锁 ${unlockedKeys.length} / 已发布 ${publishedCount} / 待发布 ${pendingCount}`, 'info', 4600);
+      } else {
+        UI.toast(`扫描失败：${slug}（${reasonLabel(reasonCode)}）`, 'error', 5600);
+      }
+    }
+
+    if (refreshPanel && isAddReleasePage()) {
+      renderPendingPanel().catch((error) => Logger.error('refresh pending panel failed', error));
+    }
+
+    return {
+      ok: isSuccess,
+      slug,
+      report,
+      unlockedCount: unlockedKeys.length,
+      publishedCount,
+      pendingCount
+    };
+  };
+
+  const syncPublishedStatus = async () => {
+    const seriesRows = await buildSeriesSyncRows();
+    const slugs = seriesRows
+      .filter((item) => item.canSync)
+      .map((item) => item.slug);
+
+    if (!slugs.length) {
+      UI.toast('当前系列均已同步，无需重复扫描', 'info', 4200);
+      return;
+    }
+
+    const cooldown = await readNuwafCooldownState();
+    if (cooldown.active) {
+      UI.toast(`检测到近期风控记录（剩余约 ${formatCooldownRemain(cooldown.untilTs)}），建议优先逐条同步失败项`, 'warn', 5200);
+    }
+
+    let success = 0;
+    let failed = 0;
+    const reasonStats = {};
+
+    for (let idx = 0; idx < slugs.length; idx += 1) {
+      const slug = slugs[idx];
+      const result = await syncSingleSeriesStatus(slug, { showToast: false, refreshPanel: false });
+      if (result.ok) {
+        success += 1;
+      } else {
+        failed += 1;
+        const reasonCode = result.report?.reasonCode || SyncReason.TEMP_NETWORK;
+        reasonStats[reasonCode] = (reasonStats[reasonCode] || 0) + 1;
+      }
+
+      if (idx < slugs.length - 1) {
+        await sleepNuSeriesGap();
+      }
+    }
 
     const reasonSummary = Object.entries(reasonStats)
       .map(([code, count]) => `${code}:${count}`)
       .join(', ');
-    Logger.info('sync published summary', {
-      runId,
-      blocked,
-      abortedByWaf,
-      success,
-      failed,
-      persisted,
-      reasonStats
-    });
-
-    const summaryText = blocked
-      ? `同步阻断：${scanResults.length} 本中存在失败，已停止落盘并清空待发布候选`
-      : `同步完成：成功 ${success} / 失败 ${failed} / 已落盘 ${persisted}`;
-    const cooldownNote = abortedByWaf && cooldownUntilText
-      ? `，风控冷却至 ${new Date(cooldownUntilText).toLocaleTimeString()}`
-      : '';
-    if (abortedByWaf) {
-      UI.toast(`触发站点风控，已立即停止本轮${cooldownNote}`, 'error', 7200);
-    }
-    UI.toast(reasonSummary ? `${summaryText}${cooldownNote}（${reasonSummary}）` : `${summaryText}${cooldownNote}`, blocked ? 'error' : 'info', 6400);
+    const summaryText = `批量同步完成：成功 ${success} / 失败 ${failed}。失败项可在下方逐条重试`;
+    UI.toast(reasonSummary ? `${summaryText}（${reasonSummary}）` : summaryText, failed > 0 ? 'warn' : 'info', 6200);
 
     if (isAddReleasePage()) {
       renderPendingPanel().catch((error) => Logger.error('refresh pending panel failed', error));
     }
+  };
+
+  const buildSeriesSyncRows = async () => {
+    const data = await ensureNovelDataLoaded();
+    const configs = data.novelConfigs || {};
+    const published = data.publishedReleases || {};
+    const diagnostics = ensureSyncDiagnosticsMap(data);
+    const scopedEntries = pickScopedNovelEntries(data);
+
+    return scopedEntries.map(([slug, novel]) => {
+      const config = configs[slug] || {};
+      const diag = diagnostics[slug];
+      const unlockedKeys = getUnlockedReleaseKeys(novel);
+      const publishedKeys = SyncRules.sortReleaseKeys(published[slug]?.releases || []);
+      const pendingKeys = SyncRules.buildPendingReleaseKeys({
+        unlockedKeys,
+        publishedKeys
+      });
+      const statusText = isHighConfidenceSync(diag)
+        ? '已同步'
+        : (diag?.reasonCode ? `失败：${reasonLabel(diag.reasonCode)}` : '未同步');
+      const canSync = !isHighConfidenceSync(diag);
+      const syncButtonText = !canSync
+        ? '已同步'
+        : (diag?.reasonCode ? '重试同步' : '同步本条');
+      return {
+        slug,
+        novelTitle: novel.title,
+        nuSlug: normalizeNuSlugInput(config.nuSlug || ''),
+        unlockedCount: unlockedKeys.length,
+        publishedCount: publishedKeys.length,
+        pendingCount: pendingKeys.length,
+        statusText,
+        canSync,
+        syncButtonText,
+        scannedAt: diag?.scannedAt || ''
+      };
+    });
   };
 
   const buildPendingList = async () => {
@@ -1736,14 +1703,9 @@
     const configs = data.novelConfigs || {};
     const published = data.publishedReleases || {};
     const diagnostics = ensureSyncDiagnosticsMap(data);
+    const submitDismissedMap = await readSubmitDismissedMap();
     const scopedEntries = pickScopedNovelEntries(data);
-    const globalBlocked = Boolean(data.meta?.lastSyncBlocked);
-
-    if (STRICT_PENDING_MODE && globalBlocked) {
-      return [];
-    }
-
-    const pending = [];
+    const pendingMap = new Map();
 
     scopedEntries.forEach(([slug, novel]) => {
       if (STRICT_PENDING_MODE) {
@@ -1772,7 +1734,14 @@
         }
 
         const releaseFormat = config.releaseFormat === 'c' ? `c${chapter.index}` : `Chapter ${chapter.index}`;
-        pending.push({
+        const token = `${slug}:${releaseKey}`;
+        if (submitDismissedMap[token]) {
+          return;
+        }
+        if (pendingMap.has(token)) {
+          return;
+        }
+        pendingMap.set(token, {
           slug,
           novelTitle: novel.title,
           chapterName: chapter.name,
@@ -1786,7 +1755,7 @@
       });
     });
 
-    return pending.sort((a, b) => a.chapterIndex - b.chapterIndex);
+    return [...pendingMap.values()].sort((a, b) => a.chapterIndex - b.chapterIndex);
   };
 
   const fillBySelectors = (selectors, value) => {
@@ -1820,6 +1789,208 @@
       }
     }
     return '';
+  };
+
+  const toPendingSubmitToken = (payload) => {
+    const slug = String(payload?.slug || '').trim();
+    const releaseKey = SyncRules.normalizeReleaseKey(payload?.releaseKey || '');
+    if (!slug || !releaseKey) {
+      return '';
+    }
+    return `${slug}:${releaseKey}`;
+  };
+
+  const readPendingSubmit = async () => {
+    const raw = await Storage.getPath(PENDING_SUBMIT_PATH, null);
+    if (!raw || typeof raw !== 'object') {
+      return null;
+    }
+
+    const slug = String(raw.slug || '').trim();
+    const releaseKey = SyncRules.normalizeReleaseKey(raw.releaseKey || '');
+    const at = String(raw.at || '').trim();
+    if (!slug || !releaseKey) {
+      return null;
+    }
+
+    const atTs = Date.parse(at);
+    if (atTs && Date.now() - atTs > PENDING_SUBMIT_MAX_AGE_MS) {
+      await Storage.update(PENDING_SUBMIT_PATH, null);
+      return null;
+    }
+
+    return {
+      slug,
+      releaseKey,
+      releaseText: String(raw.releaseText || '').trim(),
+      novelTitle: String(raw.novelTitle || '').trim(),
+      link: String(raw.link || '').trim(),
+      at: at || new Date().toISOString()
+    };
+  };
+
+  const setPendingSubmit = async (item) => {
+    const payload = {
+      slug: String(item?.slug || '').trim(),
+      releaseKey: SyncRules.normalizeReleaseKey(item?.releaseKey || ''),
+      releaseText: String(item?.releaseText || '').trim(),
+      novelTitle: String(item?.novelTitle || '').trim(),
+      link: String(item?.link || '').trim(),
+      at: new Date().toISOString()
+    };
+    if (!payload.slug || !payload.releaseKey) {
+      return null;
+    }
+    await Storage.update(PENDING_SUBMIT_PATH, payload);
+    return payload;
+  };
+
+  const clearPendingSubmit = async () => {
+    await Storage.update(PENDING_SUBMIT_PATH, null);
+  };
+
+  const readSubmitDismissedMap = async () => {
+    const raw = await Storage.getPath(SUBMIT_DISMISSED_PATH, {});
+    return raw && typeof raw === 'object' ? raw : {};
+  };
+
+  const addSubmitDismissed = async (item, { reason = 'submit-click' } = {}) => {
+    const token = toPendingSubmitToken(item);
+    if (!token) {
+      return { token: '', already: false };
+    }
+    const map = await readSubmitDismissedMap();
+    const already = Boolean(map[token]);
+    map[token] = {
+      slug: String(item?.slug || '').trim(),
+      releaseKey: SyncRules.normalizeReleaseKey(item?.releaseKey || ''),
+      releaseText: String(item?.releaseText || '').trim(),
+      novelTitle: String(item?.novelTitle || '').trim(),
+      reason: String(reason || 'submit-click'),
+      at: new Date().toISOString()
+    };
+    await Storage.update(SUBMIT_DISMISSED_PATH, map);
+    return { token, already };
+  };
+
+  const clearSubmitDismissed = async () => {
+    await Storage.update(SUBMIT_DISMISSED_PATH, {});
+  };
+
+  const clearSubmitDismissedByPublishedKeys = async (slug, publishedKeys = []) => {
+    const targetSlug = String(slug || '').trim();
+    if (!targetSlug) {
+      return 0;
+    }
+    const normalizedPublished = new Set(SyncRules.sortReleaseKeys(publishedKeys || []));
+    if (!normalizedPublished.size) {
+      return 0;
+    }
+
+    const map = await readSubmitDismissedMap();
+    let removed = 0;
+    Object.entries(map).forEach(([token, value]) => {
+      const itemSlug = String(value?.slug || '').trim();
+      const itemKey = SyncRules.normalizeReleaseKey(value?.releaseKey || '');
+      if (itemSlug === targetSlug && itemKey && normalizedPublished.has(itemKey)) {
+        delete map[token];
+        removed += 1;
+      }
+    });
+    if (removed > 0) {
+      await Storage.update(SUBMIT_DISMISSED_PATH, map);
+    }
+    return removed;
+  };
+
+  const registerPendingSubmitOnForm = async () => {
+    if (!isAddReleasePage()) {
+      return null;
+    }
+
+    const currentPending = await readPendingSubmit();
+    if (currentPending) {
+      return currentPending;
+    }
+
+    const link = String(readFirstValue(['#arlink', 'input[name="arlink"]', 'input[name="url"]', 'input[name="link"]', '#link']) || '').trim();
+    if (!link) {
+      return null;
+    }
+
+    const pendingList = await buildPendingList();
+    const matched = pendingList.find((item) => String(item.link || '').trim() === link)
+      || pendingList.find((item) => {
+        const itemLink = String(item.link || '').trim();
+        if (!itemLink) {
+          return false;
+        }
+        return link.includes(itemLink) || itemLink.includes(link);
+      });
+    if (!matched) {
+      return null;
+    }
+
+    return setPendingSubmit(matched);
+  };
+
+  const dismissPendingSubmitOnSubmitAttempt = async () => {
+    if (!isAddReleasePage()) {
+      return false;
+    }
+    const pendingSubmit = await registerPendingSubmitOnForm();
+    if (!pendingSubmit) {
+      return false;
+    }
+    const { already } = await addSubmitDismissed(pendingSubmit, { reason: 'submit-click' });
+    await clearPendingSubmit();
+    if (!already) {
+      UI.toast(`已从待发布移除（已点击 Submit）：${pendingSubmit.novelTitle || pendingSubmit.slug} ${pendingSubmit.releaseText || pendingSubmit.releaseKey}`, 'info', 5000);
+    }
+    return true;
+  };
+
+  const installReleaseSubmitWatcher = () => {
+    if (!isAddReleasePage()) {
+      return;
+    }
+
+    const forms = [...document.querySelectorAll('form')];
+    const targetForm = forms.find((form) => {
+      const controls = [...form.querySelectorAll('button[type="submit"], input[type="submit"]')];
+      return controls.some((control) => /submit/i.test(String(control.value || control.textContent || '')));
+    }) || forms[0];
+
+    if (!targetForm || targetForm.dataset.synnovelReleaseSubmitWatcherBound === '1') {
+      return;
+    }
+    targetForm.dataset.synnovelReleaseSubmitWatcherBound = '1';
+
+    targetForm.addEventListener('submit', () => {
+      dismissPendingSubmitOnSubmitAttempt()
+        .then((changed) => {
+          if (changed) {
+            renderPendingPanel().catch((error) => Logger.warn('refresh pending panel after submit failed', error));
+          }
+        })
+        .catch((error) => Logger.warn('dismiss pending on form submit failed', error));
+    });
+
+    [...targetForm.querySelectorAll('button[type="submit"], input[type="submit"]')].forEach((button) => {
+      if (button.dataset.synnovelReleaseSubmitWatcherBound === '1') {
+        return;
+      }
+      button.dataset.synnovelReleaseSubmitWatcherBound = '1';
+      button.addEventListener('click', () => {
+        dismissPendingSubmitOnSubmitAttempt()
+          .then((changed) => {
+            if (changed) {
+              renderPendingPanel().catch((error) => Logger.warn('refresh pending panel after click failed', error));
+            }
+          })
+          .catch((error) => Logger.warn('dismiss pending on click failed', error));
+      });
+    });
   };
 
   const normalizeText = (value) => String(value || '')
@@ -2012,10 +2183,11 @@
     }
 
     const canSubmit = Boolean(seriesHiddenValue) && (!hasGroupName || Boolean(groupHiddenValue));
+    await setPendingSubmit(item);
     if (canSubmit) {
-      UI.toast(`已填充：${item.novelTitle} ${item.releaseText}，请点击 Submit，提交后点“同步已发布”确认`, 'info', 5600);
+      UI.toast(`已填充并置灰：${item.novelTitle} ${item.releaseText}，请点击 Submit，点击后将自动从待发布移除`, 'info', 6200);
     } else {
-      UI.toast('已填充但 Series/Group 可能未命中，请手动检查后再提交', 'warn', 5600);
+      UI.toast('已填充并置灰，但 Series/Group 可能未命中；如仍点击 Submit，本条也会移除', 'warn', 6200);
     }
 
     if (isAddReleasePage()) {
@@ -2024,7 +2196,13 @@
   };
 
   const renderPendingPanel = async () => {
-    const pending = await buildPendingList();
+    const [pending, seriesRows, pendingSubmit] = await Promise.all([
+      buildPendingList(),
+      buildSeriesSyncRows(),
+      readPendingSubmit()
+    ]);
+    const pendingSubmitToken = toPendingSubmitToken(pendingSubmit);
+    const syncableSeriesRows = seriesRows.filter((item) => item.canSync);
 
     [...document.querySelectorAll('[data-synnovel-panel="pending"]')].forEach((panel) => panel.remove());
 
@@ -2036,8 +2214,12 @@
       title: `待发布章节 (${pending.length})`,
       actions: [
         { label: '🔄 刷新状态', onClick: () => renderPendingPanel() },
-        { label: '🧲 拉取私域', onClick: () => importDataFromFoxBridge().then(() => renderPendingPanel()) },
-        { label: '📡 同步已发布', primary: true, onClick: () => syncPublishedStatus() }
+        { label: '🧲 拉取私域', onClick: () => importDataFromFoxBridge({ clearSyncState: true }).then(() => renderPendingPanel()) },
+        {
+          label: '🧹 清除置灰',
+          onClick: () => Promise.all([clearPendingSubmit(), clearSubmitDismissed()]).then(() => renderPendingPanel())
+        },
+        { label: '📡 同步全部', primary: true, onClick: () => syncPublishedStatus() }
       ]
     });
     panel.dataset.synnovelPanel = 'pending';
@@ -2051,7 +2233,7 @@
     if (!pending.length) {
       const empty = document.createElement('div');
       empty.textContent = STRICT_PENDING_MODE
-        ? '暂无待发布章节（严格模式仅展示高可信同步结果，请先点击“同步已发布”）'
+        ? '暂无待发布章节（严格模式仅展示高可信同步结果，请先点击“同步全部”或“同步本条”）'
         : '暂无待发布章节';
       empty.style.fontSize = '12px';
       listWrap.appendChild(empty);
@@ -2065,12 +2247,19 @@
         row.style.padding = '4px 0';
 
         const label = document.createElement('span');
-        label.textContent = `${item.novelTitle} - ${item.releaseText}`;
+        const itemToken = toPendingSubmitToken(item);
+        const isPendingSubmit = pendingSubmitToken && itemToken === pendingSubmitToken;
+        label.textContent = `${item.novelTitle} - ${item.releaseText}${isPendingSubmit ? '（待提交）' : ''}`;
         label.style.fontSize = '12px';
 
         const btn = document.createElement('button');
-        btn.textContent = '填充';
+        btn.textContent = isPendingSubmit ? '待提交' : '填充';
         btn.style.fontSize = '11px';
+        btn.disabled = Boolean(isPendingSubmit);
+        if (isPendingSubmit) {
+          btn.style.opacity = '0.65';
+          btn.style.cursor = 'not-allowed';
+        }
 
         btn.addEventListener('click', () => {
           fillReleaseForm(item).catch((error) => {
@@ -2086,6 +2275,104 @@
     }
 
     panel.appendChild(listWrap);
+
+    const seriesWrap = document.createElement('div');
+    seriesWrap.style.marginTop = '10px';
+    seriesWrap.style.borderTop = '1px solid #eceff1';
+    seriesWrap.style.paddingTop = '8px';
+
+    const seriesTitle = document.createElement('div');
+    seriesTitle.textContent = `系列同步 (${syncableSeriesRows.length})`;
+    seriesTitle.style.fontSize = '12px';
+    seriesTitle.style.fontWeight = '600';
+    seriesTitle.style.marginBottom = '6px';
+    seriesWrap.appendChild(seriesTitle);
+
+    const seriesList = document.createElement('div');
+    seriesList.style.maxHeight = '220px';
+    seriesList.style.overflow = 'auto';
+    seriesList.style.display = 'flex';
+    seriesList.style.flexDirection = 'column';
+    seriesList.style.gap = '6px';
+
+    if (!syncableSeriesRows.length) {
+      const emptySeries = document.createElement('div');
+      emptySeries.textContent = '全部系列已同步';
+      emptySeries.style.fontSize = '12px';
+      seriesList.appendChild(emptySeries);
+    } else {
+      syncableSeriesRows.forEach((item) => {
+        const row = document.createElement('div');
+        row.style.display = 'flex';
+        row.style.justifyContent = 'space-between';
+        row.style.alignItems = 'center';
+        row.style.gap = '8px';
+        row.style.padding = '4px 0';
+
+        const left = document.createElement('div');
+        left.style.display = 'flex';
+        left.style.flexDirection = 'column';
+        left.style.gap = '2px';
+        left.style.minWidth = '0';
+
+        const title = document.createElement('span');
+        title.textContent = `${item.novelTitle} (${item.slug})`;
+        title.style.fontSize = '12px';
+        title.style.whiteSpace = 'nowrap';
+        title.style.overflow = 'hidden';
+        title.style.textOverflow = 'ellipsis';
+
+        const meta = document.createElement('span');
+        meta.textContent = `${item.statusText} | 解锁 ${item.unlockedCount} / 已发布 ${item.publishedCount} / 待发布 ${item.pendingCount}`;
+        meta.style.fontSize = '11px';
+        meta.style.opacity = '0.8';
+
+        left.appendChild(title);
+        left.appendChild(meta);
+
+        const btn = document.createElement('button');
+        btn.textContent = item.syncButtonText;
+        btn.style.fontSize = '11px';
+        btn.disabled = !item.canSync;
+        if (!item.canSync) {
+          btn.style.opacity = '0.65';
+          btn.style.cursor = 'not-allowed';
+        }
+        btn.addEventListener('click', async () => {
+          if (!item.canSync) {
+            return;
+          }
+          btn.disabled = true;
+          btn.textContent = '同步中...';
+          let synced = false;
+          try {
+            const result = await syncSingleSeriesStatus(item.slug, { showToast: true, refreshPanel: false });
+            synced = Boolean(result?.ok);
+            await renderPendingPanel();
+          } catch (error) {
+            Logger.error('sync single series failed', error);
+            UI.toast(`同步失败：${item.slug}`, 'error', 4800);
+          } finally {
+            if (synced) {
+              btn.disabled = true;
+              btn.textContent = '已同步';
+              btn.style.opacity = '0.65';
+              btn.style.cursor = 'not-allowed';
+            } else {
+              btn.disabled = false;
+              btn.textContent = item.syncButtonText;
+            }
+          }
+        });
+
+        row.appendChild(left);
+        row.appendChild(btn);
+        seriesList.appendChild(row);
+      });
+    }
+
+    seriesWrap.appendChild(seriesList);
+    panel.appendChild(seriesWrap);
   };
 
   const bootstrap = async () => {
@@ -2103,6 +2390,7 @@
     await importDataFromFoxBridge({ silent: true });
 
     if (isAddReleasePage()) {
+      installReleaseSubmitWatcher();
       renderPendingPanel().catch((error) => Logger.error('init add release panel failed', error));
     }
   };
